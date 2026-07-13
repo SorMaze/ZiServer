@@ -2,7 +2,7 @@
 
 [English documentation](README.en.md) | 简体中文
 
-文档按用途分类。根目录 [`README.md`](../README.md) 提供构建、运行、配置和性能总览；这里保存面向实现、部署和维护的详细说明。
+文档按用途分类。根目录 [`README.zh-CN.md`](../README.zh-CN.md) 提供构建、运行、配置和性能总览；这里保存面向实现、部署和维护的详细说明。
 
 ## 架构与路线
 

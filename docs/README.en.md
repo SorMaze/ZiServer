@@ -5,7 +5,7 @@ English | [简体中文](README.md)
 > [!NOTE]
 > This English documentation was translated with the assistance of a large language model (LLM). If an interpretation differs, the corresponding Simplified Chinese source is authoritative.
 
-Documentation is grouped by purpose. The root [`README.en.md`](../README.en.md) provides the build, runtime, configuration, and performance overview; this directory contains implementation, deployment, and maintenance details.
+Documentation is grouped by purpose. The root [`README.md`](../README.md) provides the build, runtime, configuration, and performance overview; this directory contains implementation, deployment, and maintenance details.
 
 ## Architecture and roadmap
 
