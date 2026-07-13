@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ZiServer 双向流 Demo</title>
+  <link rel="stylesheet" href="/assets/style.css?v=site7">
+  <style>
+    main { max-width: 980px; margin: 0 auto; padding: 40px 20px; }
+    .panel { background: #fff; border: 1px solid #d7e0e3; border-radius: 10px; padding: 20px; margin: 18px 0; }
+    button { margin: 0 8px 8px 0; padding: 10px 14px; border: 0; border-radius: 6px; background: #1d2930; color: #fff; cursor: pointer; }
+    pre { min-height: 150px; overflow: auto; padding: 14px; color: #d7f4ee; background: #111a1f; border-radius: 8px; white-space: pre-wrap; }
+    code { color: #235c68; }
+  </style>
+</head>
+<body>
+  <main>
+    <p class="links"><a href="/">← Runtime lab</a><a href="/security#trust-boundary">Trust boundary</a><a href="/api#content-lab">Content lab</a><a href="/stats">Live stats</a></p>
+    <h1>HTTP/1 / HTTP/2 双向流</h1>
+    <p>打开 DevTools Network 可查看当前连接协议。响应 demo 每 250ms 产生一个 chunk；上传 demo 使用 <code>ReadableStream</code> 分块发送并读取回显。HTTP/1.1 使用 chunked framing，TLS + HTTP/2 使用 DATA 帧，但二者共享同一个 Zig Reader/Writer 和 handler。</p>
+    <section class="panel">
+      <h2>流式响应</h2>
+      <button id="download">开始读取 /stream/demo</button>
+      <button id="cancel">取消当前请求</button>
+      <pre id="download-log"></pre>
+    </section>
+    <section class="panel">
+      <h2>流式上传与回显</h2>
+      <button id="upload">发送 6 个上传 chunk</button>
+      <pre id="upload-log"></pre>
+      <p>浏览器 Fetch 可能实施 half-duplex：上传 chunk 会实时送达服务器，但 JavaScript 获得 Response 的时点由浏览器决定。仓库中的 <code>examples/duplex-client.mjs</code> 可验证真正同时收发。</p>
+    </section>
+  </main>
+  <script src="/assets/stream-demo.js?v=site7" defer></script>
+</body>
+</html>

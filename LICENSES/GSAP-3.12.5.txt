@@ -1,0 +1,21 @@
+GSAP 3.12.5 and ScrollTrigger 3.12.5 are separately licensed third-party
+assets. They are not licensed under ZiServer's BSD 2-Clause License.
+
+The distributed files are:
+
+- src/public/assets/gsap.min.js
+- src/public/assets/ScrollTrigger.min.js
+
+Their embedded upstream notice reads:
+
+    Copyright 2024, GreenSock. All rights reserved.
+    Subject to the terms at https://gsap.com/standard-license or for Club
+    GSAP members, the agreement issued with that membership.
+
+Copyright (c) 2008-2026, GreenSock. All rights reserved.
+
+The license header in each distributed asset must be retained. Consult the
+authoritative GreenSock Standard License before using, modifying, or
+redistributing these files:
+
+https://gsap.com/standard-license/

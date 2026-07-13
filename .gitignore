@@ -1,0 +1,9 @@
+.zig-cache/
+zig-out/
+.dev-certs/
+.zig-global-cache/
+*.log
+.hermes/
+.codex/
+/var/
+.agents/
