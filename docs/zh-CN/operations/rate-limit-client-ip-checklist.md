@@ -7,7 +7,7 @@
 
 ## 完成状态（2026-07-13）
 
-核心修复已经落地：`client_identity.zig` 建立 socket peer、可信代理 CIDR 和有界 XFF 边界；`rate_limiter.zig` 提供 server-owned、有界分片的 per-IP limiter；HTTP/1.1、HTTP/2、Context、访问日志、`/stats`、CLI/环境配置和部署文档均已接入。仍保留为后续项的内容是原生 HTTP/3 router/middleware 集成、RFC 7239 `Forwarded`、token bucket、parser fuzz、协议级 HTTP/2/TLS 压测及真实生产灰度。
+核心修复已经落地：`client_identity.zig` 建立 socket peer、可信代理 CIDR 和有界 XFF 边界；`rate_limiter.zig` 提供 server-owned、有界分片的 per-IP limiter；HTTP/1.1、HTTP/2、缓冲式实验 HTTP/3、Context、访问日志、`/stats`、CLI/环境配置和部署文档均已接入。仍保留为后续项的内容是 HTTP/3 验证后 path migration、RFC 7239 `Forwarded`、token bucket、parser fuzz、协议级 HTTP/2/TLS/QUIC 压测及真实生产灰度。
 
 ## 实施前源码核查结论（历史）
 
@@ -17,7 +17,7 @@
 - `src/core/context.zig:60-89` 的 `Context` 没有 `peer_ip`、`client_ip` 或身份来源字段。
 - `src/core/stream_queue.zig:11-14` 的 `PendingConnection` 只携带 stream 和 plain/TLS 标记；`src/main.zig:401-416` 接受连接后没有保存对端地址。
 - `src/core/http.zig:55-63` 的 HTTP/2 dispatch state 也没有连接对端地址；重建 HTTP/1.1 风格请求后直接进入共用 middleware。
-- 原生 HTTP/3 当前尚未完整进入 router/middleware；`src/core/quic_transport.zig` 已能取得 UDP/QUIC 数据报来源，后续接入时必须使用 QUIC path 的已验证对端地址，不能只读取 HTTP 头。
+- 原生 HTTP/3 历史上尚未进入 router/middleware；实验适配器现已使用 UDP/QUIC peer 和共用身份解析器。path migration 在 ngtcp2 验证并传播活动 path 前保持禁用。
 - `Request.header()` 只返回第一个同名头。客户端身份解析不能直接复用它而忽略重复头、合并语义和长度上限。
 - 429 已带固定 `Retry-After: 1`；在继续采用 1 秒窗口的第一阶段可以保留，若改用 token bucket 再按实际等待时间生成。
 
@@ -63,7 +63,8 @@
 - [x] 将同一个 `peer_ip` 放入 `Http2DispatchState`；每个 HTTP/2 stream 根据自己的 header 解析 `client_ip`。
 - [x] 在 middleware 前写入 `ClientIdentity`，并提供只读 `ctx.clientIp()`/`ctx.peerIp()` 接口。
 - [x] preflight 与普通 handler 走同一身份解析路径，访问日志取得相同身份。
-- [ ] HTTP/3 完成 router/middleware 集成时，使用 QUIC connection/path 的实际对端作为 `peer_ip`，并复用同一解析器；NAT rebinding/path migration 需要以 ngtcp2 验证后的活动 path 更新，不能相信数据包载荷中的头来更新 peer。
+- [x] 实验性 HTTP/3 使用初始 QUIC connection peer 作为 `peer_ip` 并复用同一解析器；单连接 session 拒绝来自其他 peer 的数据包。
+- [ ] 启用 NAT rebinding/path migration 前，只能用 ngtcp2 验证后的活动 path 更新身份。
 - [x] 保留测试/内嵌调用的显式 identity 注入入口，未使用模块级“当前客户端”全局变量。
 
 ### 配置边界
@@ -135,7 +136,7 @@
 - [ ] 同一 keep-alive 连接上的多请求使用同一 peer，但可按每个请求的已验证转发头解析身份。
 - [ ] HTTP/2 多 stream 与 HTTP/1.1 结果一致，且并发 stream 不串用身份。
 - [ ] TLS 与明文连接的 peer 获取结果一致；代理 TLS termination 的示例只在代理地址受信时采用 XFF。
-- [x] 文档明确原生 HTTP/3 尚未完整接入 middleware；接入后仍需补同等测试。
+- [x] 实验性 HTTP/3 已进入 middleware/client identity，并记录仍待完成的 migration 与协议压测。
 - [ ] 回归 429 的 `Retry-After`、HEAD/preflight、错误响应、访问日志 JSON 单行转义。
 - [x] Debug 与 ReleaseFast 均通过 `zig build test`，Debug/ReleaseFast 可执行文件构建通过。
 - [ ] 对“同一 IP 热 key”和“多 IP 分散 key”分别做 ReleaseFast 性能压测，记录吞吐、P95/P99、锁竞争和常驻内存。

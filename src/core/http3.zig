@@ -1,12 +1,16 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 
 const http_config = @import("http_config.zig");
 const http2 = @import("http2.zig");
+const client_identity = @import("client_identity.zig");
+const errors = @import("errors.zig");
 const quic_transport = @import("quic_transport.zig");
 const response = @import("response.zig");
 
 pub const linked = std.mem.eql(u8, build_options.http3_provider, "nghttp3");
+pub const capture_allocator = if (linked) std.heap.c_allocator else std.heap.page_allocator;
 
 /// Reuses HTTP/2's Request structure — layout-compatible with the C adapter.
 pub const Request = http2.Request;
@@ -21,12 +25,19 @@ pub const Summary = extern struct {
     }
 };
 
-pub const DispatchFn = http2.DispatchFn;
+pub const DispatchFn = *const fn (
+    ?*anyopaque,
+    *const Request,
+    *response.Capture,
+    client_identity.IpKey,
+) anyerror!void;
 
-const ReadFn = *const fn (*anyopaque, [*]u8, usize, ?*anyopaque, *usize) callconv(.c) isize;
+const ReadFn = *const fn (*anyopaque, [*]u8, usize, ?*anyopaque, *usize, u32) callconv(.c) isize;
 const WriteFn = *const fn (*anyopaque, [*]const u8, usize, ?*const anyopaque, usize) callconv(.c) c_int;
 const DispatchBridgeFn = *const fn (*anyopaque, *const Request, *response.Capture) callconv(.c) c_int;
 const ReleaseFn = *const fn (*anyopaque, *response.Capture) callconv(.c) void;
+const StopFn = *const fn (*anyopaque) callconv(.c) c_int;
+const NowFn = *const fn (*anyopaque) callconv(.c) u64;
 
 extern fn ziserver_nghttp3_version_text() [*:0]const u8;
 extern fn ziserver_nghttp3_serve(
@@ -35,6 +46,8 @@ extern fn ziserver_nghttp3_serve(
     write_fn: WriteFn,
     dispatch_fn: DispatchBridgeFn,
     release_fn: ReleaseFn,
+    stop_fn: StopFn,
+    now_fn: NowFn,
     ssl_ctx: ?*anyopaque,
     max_header_bytes: usize,
     max_body_bytes: usize,
@@ -46,6 +59,7 @@ const Bridge = struct {
     socket: *quic_transport.Socket,
     userdata: ?*anyopaque,
     dispatch: DispatchFn,
+    stopping: ?*const std.atomic.Value(bool),
 };
 
 pub fn versionText() ?[:0]const u8 {
@@ -59,6 +73,7 @@ pub fn serve(
     dispatch: DispatchFn,
     max_requests: usize,
     ssl_ctx: ?*anyopaque,
+    stopping: ?*const std.atomic.Value(bool),
 ) !Summary {
     if (!linked) return error.Http3ProviderUnavailable;
 
@@ -66,6 +81,7 @@ pub fn serve(
         .socket = socket,
         .userdata = userdata,
         .dispatch = dispatch,
+        .stopping = stopping,
     };
     var summary = Summary{};
     const result = ziserver_nghttp3_serve(
@@ -74,6 +90,8 @@ pub fn serve(
         writeBridge,
         dispatchBridge,
         releaseBridge,
+        stopBridge,
+        nowBridge,
         ssl_ctx,
         http_config.max_header_bytes,
         http_config.max_form_body_bytes,
@@ -86,31 +104,14 @@ pub fn serve(
     return summary;
 }
 
-fn readBridge(userdata: *anyopaque, buffer: [*]u8, len: usize, addr_out: ?*anyopaque, addrlen_out: *usize) callconv(.c) isize {
+fn readBridge(userdata: *anyopaque, buffer: [*]u8, len: usize, addr_out: ?*anyopaque, addrlen_out: *usize, timeout_ms: u32) callconv(.c) isize {
     const bridge: *Bridge = @ptrCast(@alignCast(userdata));
-    const datagram = bridge.socket.recvFrom() catch {
-        // Sleep briefly on error (wouldBlock etc.) to avoid busy-spinning
-        std.Io.sleep(bridge.socket.io, .{ .nanoseconds = 10 * std.time.ns_per_ms }, .awake) catch {};
-        return -1;
-    };
+    const datagram = (bridge.socket.recvFromTimeout(@max(timeout_ms, 1)) catch return -1) orelse return 0;
     if (datagram.len > len) return -1;
     @memcpy(buffer[0..datagram.len], bridge.socket.recv_buf[0..datagram.len]);
-    // Write back source address as platform sockaddr_in (16 bytes, AF_INET)
+    // Write back the source address in the platform sockaddr layout expected by ngtcp2.
     if (addr_out) |out_ptr| {
-        const family: u16 = 2; // AF_INET
-        const port: u16 = std.mem.nativeToBig(u16, datagram.from.getPort());
-        const ip_bytes: [4]u8 = switch (datagram.from) {
-            .ip4 => |v4| v4.bytes,
-            .ip6 => return -1, // IPv6 not yet supported in C adapter paths
-        };
-        const sockaddr_bytes = [_]u8{
-            @intCast(family & 0xff), @intCast(family >> 8), // sin_family (little-endian short)
-            @intCast(port & 0xff), @intCast(port >> 8), // sin_port (already big-endian, store LE)
-            ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3], // sin_addr
-            0, 0, 0, 0, 0, 0, 0, 0, // sin_zero[8]
-        };
-        @memcpy(@as([*]u8, @ptrCast(out_ptr)), &sockaddr_bytes);
-        addrlen_out.* = 16;
+        writeSockaddr(out_ptr, addrlen_out, datagram.from) catch return -1;
     }
     return @intCast(datagram.len);
 }
@@ -139,10 +140,75 @@ fn dispatchBridge(
     captured_response: *response.Capture,
 ) callconv(.c) c_int {
     const bridge: *Bridge = @ptrCast(@alignCast(userdata));
-    bridge.dispatch(bridge.userdata, request, captured_response) catch return -1;
+    const peer_ip = client_identity.IpKey.fromAddress(bridge.socket.last_peer);
+    bridge.dispatch(bridge.userdata, request, captured_response, peer_ip) catch |err| {
+        captured_response.deinit(capture_allocator);
+        captured_response.* = .{};
+        var target: response.Target = .{ .capture = .{
+            .response = captured_response,
+            .allocator = capture_allocator,
+            .secure = true,
+        } };
+        _ = errors.write(&target, errors.kindFromError(err), false, false) catch return -1;
+    };
     return 0;
 }
 
 fn releaseBridge(_: *anyopaque, captured_response: *response.Capture) callconv(.c) void {
-    captured_response.deinit(std.heap.page_allocator);
+    captured_response.deinit(capture_allocator);
+}
+
+fn stopBridge(userdata: *anyopaque) callconv(.c) c_int {
+    const bridge: *Bridge = @ptrCast(@alignCast(userdata));
+    const stopping = bridge.stopping orelse return 0;
+    return @intFromBool(stopping.load(.acquire));
+}
+
+fn nowBridge(userdata: *anyopaque) callconv(.c) u64 {
+    const bridge: *Bridge = @ptrCast(@alignCast(userdata));
+    const value = std.Io.Clock.awake.now(bridge.socket.io).nanoseconds;
+    return @intCast(@max(value, 0));
+}
+
+fn writeSockaddr(out_ptr: *anyopaque, addrlen_out: *usize, address: std.Io.net.IpAddress) !void {
+    const out: [*]u8 = @ptrCast(out_ptr);
+    switch (address) {
+        .ip4 => |ip4| {
+            if (addrlen_out.* < 16) return error.AddressBufferTooSmall;
+            const port = std.mem.nativeToBig(u16, ip4.port);
+            const bytes = [_]u8{
+                2,                     0,
+                @intCast(port & 0xff), @intCast(port >> 8),
+                ip4.bytes[0],          ip4.bytes[1],
+                ip4.bytes[2],          ip4.bytes[3],
+                0,                     0,
+                0,                     0,
+                0,                     0,
+                0,                     0,
+            };
+            @memcpy(out[0..bytes.len], &bytes);
+            addrlen_out.* = bytes.len;
+        },
+        .ip6 => |ip6| {
+            if (addrlen_out.* < 28) return error.AddressBufferTooSmall;
+            @memset(out[0..28], 0);
+            out[0] = if (builtin.os.tag == .windows) 23 else 10;
+            const port = std.mem.nativeToBig(u16, ip6.port);
+            out[2] = @intCast(port & 0xff);
+            out[3] = @intCast(port >> 8);
+            @memcpy(out[8..24], &ip6.bytes);
+            addrlen_out.* = 28;
+        },
+    }
+}
+
+test "HTTP3 sockaddr bridge preserves IPv4 peer address" {
+    var bytes: [128]u8 = @splat(0);
+    var len = bytes.len;
+    const address = try std.Io.net.IpAddress.parseIp4("192.0.2.44", 18443);
+    try writeSockaddr(&bytes, &len, address);
+    try std.testing.expectEqual(@as(usize, 16), len);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 0, 2, 44 }, bytes[4..8]);
+    try std.testing.expectEqual(@as(u8, 0x48), bytes[2]);
+    try std.testing.expectEqual(@as(u8, 0x0b), bytes[3]);
 }

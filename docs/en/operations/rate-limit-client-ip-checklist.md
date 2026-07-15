@@ -12,7 +12,7 @@ This phased implementation, test, and rollout checklist addresses two coupled pr
 
 ## Completion status (2026-07-13)
 
-The core fix is implemented. `client_identity.zig` establishes bounded trust among socket peers, trusted-proxy CIDRs, and XFF; `rate_limiter.zig` provides a server-owned bounded sharded per-IP limiter. HTTP/1.1, HTTP/2, Context, access logs, `/stats`, CLI/environment configuration, and deployment documentation are integrated. Remaining work: native HTTP/3 router/middleware integration, RFC 7239 `Forwarded`, token bucket, parser fuzzing, protocol-level HTTP/2/TLS load testing, and real production canaries.
+The core fix is implemented. `client_identity.zig` establishes bounded trust among socket peers, trusted-proxy CIDRs, and XFF; `rate_limiter.zig` provides a server-owned bounded sharded per-IP limiter. HTTP/1.1, HTTP/2, the buffered experimental HTTP/3 path, Context, access logs, `/stats`, CLI/environment configuration, and deployment documentation are integrated. Remaining work: validated HTTP/3 path migration, RFC 7239 `Forwarded`, token bucket, parser fuzzing, protocol-level HTTP/2/TLS/QUIC load testing, and real production canaries.
 
 ## Historical pre-implementation source review
 
@@ -20,7 +20,7 @@ The core fix is implemented. `client_identity.zig` establishes bounded trust amo
 - The effective key space had only two windows; all routes and clients on one policy consumed the same budget.
 - The old implementation used a one-second fixed window and one mutex. Tests covered threshold/recovery only, not client isolation, concurrency, or proxy forgery.
 - `Context`, `PendingConnection`, accept, and HTTP/2 dispatch state did not carry peer/client identity.
-- Native HTTP/3 was not fully routed through middleware; future integration must use the QUIC path's validated peer rather than HTTP headers.
+- Native HTTP/3 historically bypassed middleware. The experimental adapter now uses the UDP/QUIC peer and shared identity resolver; path migration remains disabled until active paths are validated and propagated by ngtcp2.
 - `Request.header()` returns only the first repeated header and was unsuitable for identity parsing without duplicate, merge, and length rules.
 - 429 already carried `Retry-After: 1`, appropriate while the first implementation remains a one-second window.
 
@@ -66,7 +66,8 @@ Examples:
 - [x] Put the same peer in `Http2DispatchState`; each HTTP/2 stream resolves its own client from its headers.
 - [x] Populate identity before middleware and expose read-only `ctx.clientIp()` / `ctx.peerIp()`.
 - [x] Preflight and ordinary handlers use the same identity path; access logs see the same result.
-- [ ] Native HTTP/3 must use the active QUIC connection/path peer after ngtcp2 validation. NAT rebinding/path migration must update identity only from the validated active path.
+- [x] Experimental HTTP/3 uses the initial QUIC connection peer and the shared resolver; packets from another peer are rejected for the single-connection session.
+- [ ] NAT rebinding/path migration must update identity only from an ngtcp2-validated active path before migration is enabled.
 - [x] Keep explicit identity injection for tests/embedded calls; no module-global “current client.”
 
 ### Configuration boundary
@@ -138,7 +139,7 @@ Examples:
 - [ ] Multiple requests on one keep-alive connection share the peer but resolve each verified forwarded header independently.
 - [ ] HTTP/2 multi-stream matches HTTP/1.1 and never crosses identities.
 - [ ] TLS and plaintext peer acquisition match; proxy TLS termination uses XFF only from a trusted proxy.
-- [x] Document native HTTP/3's missing middleware integration and require equivalent tests after integration.
+- [x] Route experimental HTTP/3 through middleware/client identity and document the remaining migration and protocol-load-test gaps.
 - [ ] Regress `Retry-After`, HEAD/preflight, error responses, and single-line JSON log escaping.
 - [x] Debug/ReleaseFast `zig build test` and executable builds pass.
 - [ ] Benchmark hot single-IP and distributed multi-IP loads, recording throughput, P95/P99, lock contention, and resident memory.

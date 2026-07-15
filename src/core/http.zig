@@ -7,6 +7,7 @@ const middleware = @import("middleware.zig");
 const page_cache = @import("page_cache.zig");
 const http_config = @import("http_config.zig");
 const http2 = @import("http2.zig");
+const http3 = @import("http3.zig");
 const http1_body_stream = @import("http1_body_stream.zig");
 const logger = @import("log.zig");
 const protocol = @import("protocol.zig");
@@ -120,6 +121,15 @@ const Http2DispatchState = struct {
     identity_resolver: client_identity.Resolver,
     redirect_destination: ?protocol_redirect.Destination = null,
     redirect_host_policy: protocol_redirect.HostPolicy = .{},
+};
+
+pub const Http3DispatchState = struct {
+    io: std.Io,
+    stats: *stats_mod.Stats,
+    static_store: *const static.Store,
+    app: *const Application,
+    access_log_enabled: bool,
+    identity_resolver: client_identity.Resolver,
 };
 
 pub fn serveConnection(
@@ -578,6 +588,184 @@ fn dispatchHttp2Request(
             .identity_resolver = state.identity_resolver,
         },
         selected_reader,
+    );
+}
+
+pub fn dispatchHttp3Request(
+    userdata: ?*anyopaque,
+    h3_request: *const http3.Request,
+    captured_response: *response.Capture,
+    peer_ip: client_identity.IpKey,
+) !void {
+    const state: *Http3DispatchState = @ptrCast(@alignCast(userdata orelse return error.Http3DispatchFailed));
+    if (h3_request.error_status != 0) {
+        return switch (h3_request.error_status) {
+            413 => error.RequestBodyTooLarge,
+            431 => error.RequestHeaderTooLarge,
+            else => error.BadRequest,
+        };
+    }
+
+    const method = h3_request.method();
+    const path = h3_request.path();
+    const authority = h3_request.authority();
+    if (method.len == 0 or path.len == 0 or authority.len == 0) return error.BadRequest;
+    if (containsLineBreak(method) or containsLineBreak(path) or containsLineBreak(authority)) return error.BadRequest;
+
+    var raw_buffer: [http_config.max_request_bytes]u8 = undefined;
+    var cursor: usize = 0;
+    try appendFormatted(&raw_buffer, &cursor, "{s} {s} HTTP/1.1\r\n", .{ method, path });
+
+    var has_host = false;
+    var declared_content_length: ?usize = null;
+    for (h3_request.headers()) |header| {
+        const name = header.name_ptr[0..header.name_len];
+        const value = header.value_ptr[0..header.value_len];
+        if (containsLineBreak(name) or containsLineBreak(value)) return error.BadRequest;
+        if (name.len != 0 and name[0] == ':') return error.BadRequest;
+        if (isConnectionSpecificHeader(name)) return error.BadRequest;
+        if (std.ascii.eqlIgnoreCase(name, "host")) {
+            if (has_host or !std.ascii.eqlIgnoreCase(value, authority)) return error.BadRequest;
+            has_host = true;
+        }
+        if (std.ascii.eqlIgnoreCase(name, http_config.HeaderName.content_length)) {
+            if (declared_content_length != null) return error.BadRequest;
+            declared_content_length = std.fmt.parseInt(usize, value, 10) catch return error.BadRequest;
+        }
+        try appendFormatted(&raw_buffer, &cursor, "{s}: {s}\r\n", .{ name, value });
+    }
+    if (!has_host) try appendFormatted(&raw_buffer, &cursor, "Host: {s}\r\n", .{authority});
+    try appendSlice(&raw_buffer, &cursor, "\r\n");
+
+    const body = h3_request.body();
+    if (declared_content_length) |declared| if (declared != body.len) return error.BadRequest;
+    const header_request = try request_mod.Request.parse(raw_buffer[0..cursor]);
+    const resolved_handler = state.app.routes.resolveHandler(header_request);
+    const live_body = resolved_handler != null and resolved_handler.?.options.streaming_body;
+    if (!live_body) try appendSlice(&raw_buffer, &cursor, body);
+
+    var target: response.Target = .{ .capture = .{
+        .response = captured_response,
+        .allocator = http3.capture_allocator,
+        .secure = true,
+    } };
+    _ = try serveRequest(
+        &target,
+        state.io,
+        raw_buffer[0..cursor],
+        resolved_handler,
+        state.stats,
+        state.static_store,
+        state.app,
+        false,
+        true,
+        "h3",
+        .{
+            .http3 = .off,
+            .connection_is_tls = true,
+            .access_log_enabled = state.access_log_enabled,
+            .peer_ip = peer_ip,
+            .identity_resolver = state.identity_resolver,
+        },
+        if (live_body) streaming.Reader.buffered(body) else null,
+    );
+}
+
+fn http3DispatchTestState(
+    stats: *stats_mod.Stats,
+    static_store: *const static.Store,
+    app: *const Application,
+) Http3DispatchState {
+    return .{
+        .io = std.testing.io,
+        .stats = stats,
+        .static_store = static_store,
+        .app = app,
+        .access_log_enabled = false,
+        .identity_resolver = .{},
+    };
+}
+
+test "HTTP3 dispatch reaches the shared router and secure response capture" {
+    var stats = stats_mod.Stats.init(false);
+    const static_store = static.Store.embedded();
+    const app = Application{
+        .routes = .{ .entries = &.{} },
+        .dispatch = struct {
+            fn dispatch(_: *Context, _: router.Handler) anyerror!void {}
+        }.dispatch,
+    };
+    var state = http3DispatchTestState(&stats, &static_store, &app);
+    const method = "GET";
+    const path = "/missing-over-h3";
+    const authority = "example.test";
+    const request = http3.Request{
+        .method_ptr = method.ptr,
+        .method_len = method.len,
+        .path_ptr = path.ptr,
+        .path_len = path.len,
+        .authority_ptr = authority.ptr,
+        .authority_len = authority.len,
+        .headers_ptr = null,
+        .headers_len = 0,
+        .body_ptr = null,
+        .body_len = 0,
+        .error_status = 0,
+    };
+    var captured = response.Capture{};
+    defer captured.deinit(http3.capture_allocator);
+
+    try dispatchHttp3Request(&state, &request, &captured, try client_identity.IpKey.parse("203.0.113.8"));
+
+    try std.testing.expectEqual(@as(u16, 404), captured.status);
+    var found_hsts = false;
+    for (captured.headers[0..captured.headers_len]) |header| {
+        if (std.mem.eql(u8, header.name_ptr[0..header.name_len], "strict-transport-security")) {
+            found_hsts = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_hsts);
+}
+
+test "HTTP3 dispatch rejects duplicate content length" {
+    var stats = stats_mod.Stats.init(false);
+    const static_store = static.Store.embedded();
+    const app = Application{
+        .routes = .{ .entries = &.{} },
+        .dispatch = struct {
+            fn dispatch(_: *Context, _: router.Handler) anyerror!void {}
+        }.dispatch,
+    };
+    var state = http3DispatchTestState(&stats, &static_store, &app);
+    const method = "POST";
+    const path = "/submit";
+    const authority = "example.test";
+    const name = "content-length";
+    const value = "0";
+    const headers = [_]response.CapturedHeader{
+        .{ .name_ptr = name.ptr, .name_len = name.len, .value_ptr = value.ptr, .value_len = value.len },
+        .{ .name_ptr = name.ptr, .name_len = name.len, .value_ptr = value.ptr, .value_len = value.len },
+    };
+    const request = http3.Request{
+        .method_ptr = method.ptr,
+        .method_len = method.len,
+        .path_ptr = path.ptr,
+        .path_len = path.len,
+        .authority_ptr = authority.ptr,
+        .authority_len = authority.len,
+        .headers_ptr = &headers,
+        .headers_len = headers.len,
+        .body_ptr = null,
+        .body_len = 0,
+        .error_status = 0,
+    };
+    var captured = response.Capture{};
+    defer captured.deinit(http3.capture_allocator);
+
+    try std.testing.expectError(
+        error.BadRequest,
+        dispatchHttp3Request(&state, &request, &captured, client_identity.IpKey.loopback()),
     );
 }
 
@@ -1260,9 +1448,15 @@ fn serveRequest(
     const start_ns = nowNs(io);
 
     var alt_svc_buf: [64]u8 = undefined;
+    var transport_header_buf: [1]response.Header = undefined;
+    const transport_headers: []const response.Header = if (options.http3 == .advertise and options.connection_is_tls) block: {
+        const value = std.fmt.bufPrint(&alt_svc_buf, "h3=\":{d}\"", .{options.http3_port}) catch break :block &.{};
+        transport_header_buf[0] = .{ .name = "Alt-Svc", .value = value };
+        break :block transport_header_buf[0..1];
+    } else &.{};
 
     const request = request_mod.Request.parse(raw_request) catch {
-        const summary = try errors.write(writer, .bad_request, false, false);
+        const summary = try errors.writeExtra(writer, .bad_request, false, false, transport_headers);
         logRequestParts(options.access_log_enabled, io, protocol_name, "BAD", "-", summary.status, summary.body_bytes, start_ns, client_identity.ClientIdentity.direct(options.peer_ip));
         return .close;
     };
@@ -1271,13 +1465,13 @@ fn serveRequest(
 
     const body_limit = routeBodyLimit(resolved_handler);
     if (request.body.len > body_limit) {
-        const summary = try errors.write(writer, .payload_too_large, request.isHead(), false);
+        const summary = try errors.writeExtra(writer, .payload_too_large, request.isHead(), false, transport_headers);
         logRequest(options.access_log_enabled, io, protocol_name, request, summary.status, summary.body_bytes, start_ns, identity);
         return .close;
     }
     if (request.contentLength()) |declared| {
         if (declared > body_limit) {
-            const summary = try errors.write(writer, .payload_too_large, request.isHead(), false);
+            const summary = try errors.writeExtra(writer, .payload_too_large, request.isHead(), false, transport_headers);
             logRequest(options.access_log_enabled, io, protocol_name, request, summary.status, summary.body_bytes, start_ns, identity);
             return .close;
         }
@@ -1321,9 +1515,7 @@ fn serveRequest(
                 ctx.setRequestBodyStream(reader);
             }
             defer ctx.finishPageCacheFill();
-            if (options.http3 == .advertise and options.connection_is_tls) {
-                ctx.addHeader("Alt-Svc", std.fmt.bufPrint(&alt_svc_buf, "h3=\":{d}\"", .{options.http3_port}) catch &.{}) catch {};
-            }
+            for (transport_headers) |header| try ctx.addTransportHeader(header.name, header.value);
             const middleware_decision = middleware.run(&ctx, app.middleware_stack) catch |err| block: {
                 try writeContextError(&ctx, err);
                 break :block .stop;
@@ -1356,9 +1548,7 @@ fn serveRequest(
             ctx.setClientIdentity(identity);
             ctx.setRateLimiter(app.rate_limiter);
             defer ctx.deinit();
-            if (options.http3 == .advertise and options.connection_is_tls) {
-                ctx.addHeader("Alt-Svc", std.fmt.bufPrint(&alt_svc_buf, "h3=\":{d}\"", .{options.http3_port}) catch &.{}) catch {};
-            }
+            for (transport_headers) |header| try ctx.addTransportHeader(header.name, header.value);
             const middleware_decision = middleware.run(&ctx, app.middleware_stack) catch |err| block: {
                 try writeContextError(&ctx, err);
                 break :block .stop;
@@ -1381,11 +1571,12 @@ fn serveRequest(
             reusable = ctx.keep_alive;
         },
         .method_not_allowed => {
-            const summary = try errors.write(
+            const summary = try errors.writeExtra(
                 writer,
                 .method_not_allowed,
                 head,
                 keep_alive,
+                transport_headers,
             );
             log_status = summary.status;
             log_body_bytes = summary.body_bytes;
@@ -1401,18 +1592,19 @@ fn serveRequest(
                 head,
                 keep_alive,
                 asset.cache,
-                &.{},
+                transport_headers,
             );
             log_status = .ok;
             log_body_bytes = if (head) 0 else asset.body.len;
             log_cache.response_policy = asset.cache;
         },
         .not_found => {
-            const summary = try errors.write(
+            const summary = try errors.writeExtra(
                 writer,
                 .not_found,
                 head,
                 keep_alive,
+                transport_headers,
             );
             log_status = summary.status;
             log_body_bytes = summary.body_bytes;
@@ -1447,6 +1639,56 @@ fn routeBodyLimit(resolved_handler: ?router.ResolvedHandler) usize {
     else
         http_config.max_form_body_bytes;
     return @min(handler.options.body_limit orelse http_config.max_form_body_bytes, hard_limit);
+}
+
+test "HTTPS static responses advertise the native HTTP3 endpoint" {
+    var captured = response.Capture{};
+    defer captured.deinit(std.testing.allocator);
+    var target: response.Target = .{ .capture = .{
+        .response = &captured,
+        .allocator = std.testing.allocator,
+        .secure = true,
+    } };
+    var stats = stats_mod.Stats.init(false);
+    const static_store = static.Store.filesystem(std.testing.io, std.testing.allocator, "src/public");
+    const app = Application{
+        .routes = .{ .entries = &.{} },
+        .dispatch = struct {
+            fn dispatch(_: *Context, _: router.Handler) anyerror!void {}
+        }.dispatch,
+    };
+
+    _ = try serveRequest(
+        &target,
+        std.testing.io,
+        "GET /index.html HTTP/1.1\r\nHost: example.test\r\n\r\n",
+        null,
+        &stats,
+        &static_store,
+        &app,
+        true,
+        false,
+        "h2",
+        .{
+            .http3 = .advertise,
+            .http3_port = 8443,
+            .connection_is_tls = true,
+            .access_log_enabled = false,
+        },
+        null,
+    );
+
+    try std.testing.expectEqual(@as(u16, 200), captured.status);
+    var found_alt_svc = false;
+    for (captured.headers[0..captured.headers_len]) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name_ptr[0..header.name_len], "Alt-Svc") and
+            std.mem.eql(u8, header.value_ptr[0..header.value_len], "h3=\":8443\""))
+        {
+            found_alt_svc = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_alt_svc);
 }
 
 test "streaming routes may exceed the buffered body ceiling" {

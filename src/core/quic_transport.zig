@@ -26,6 +26,22 @@ pub const Socket = struct {
         return .{ .len = msg.data.len, .from = msg.from };
     }
 
+    pub fn recvFromTimeout(self: *Socket, timeout_ms: u32) !?struct { len: usize, from: net.IpAddress } {
+        const msg = self.inner.receiveTimeout(
+            self.io,
+            self.recv_buf[0..],
+            .{ .duration = .{
+                .raw = .{ .nanoseconds = @as(i64, timeout_ms) * std.time.ns_per_ms },
+                .clock = .awake,
+            } },
+        ) catch |err| switch (err) {
+            error.Timeout => return null,
+            else => return err,
+        };
+        self.last_peer = msg.from;
+        return .{ .len = msg.data.len, .from = msg.from };
+    }
+
     pub fn sendTo(self: *Socket, data: []const u8, dest: net.IpAddress) !void {
         try self.inner.send(self.io, &dest, data);
     }

@@ -489,7 +489,10 @@ fn applyHttp3Provider(
 
     if (resolved_include.len != 0) module.addIncludePath(optionPath(b, resolved_include));
     if (resolved_lib_dir.len != 0) module.addLibraryPath(optionPath(b, resolved_lib_dir));
-    module.addCSourceFile(.{ .file = b.path("src/core/http3_nghttp3_adapter.c") });
+    module.addCSourceFile(.{
+        .file = b.path("src/core/http3_nghttp3_adapter.c"),
+        .flags = &.{ "-Wall", "-Wextra", "-Wpedantic" },
+    });
     module.linkSystemLibrary("c", .{});
     module.linkSystemLibrary("ngtcp2", .{});
     module.linkSystemLibrary("ngtcp2_crypto_ossl", .{});

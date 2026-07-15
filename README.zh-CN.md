@@ -401,7 +401,8 @@ JSON 字段包含 `time_unix_ms`、`level`、`event`、`protocol`、`method`、`
 - `--keep-alive=N` 同样限制单个 h2 session 完成的请求数；达到上限后发送 `NO_ERROR` GOAWAY，等待已接收 stream 排空。session 结束时输出 `http2_session_closed` JSON Lines 事件，包含请求数、最高 stream id 和 GOAWAY 状态。
 - 收到进程停机信号时，阻塞读取会在内部 50 ms 检查周期内被取消，h2 session 随即发送 `NO_ERROR` GOAWAY；该检查周期不改变用户配置的请求或 keep-alive 绝对超时。
 - `--http3=advertise` 配合 `-Dhttp3=nghttp3` 编译时，ZiServer 会在同一进程中监听 QUIC/UDP 端口（默认 443），通过 ngtcp2 完成 QUIC 握手和传输，再用 nghttp3 解析 HTTP/3 帧。QUIC session 共享现有 TLS 证书配置（基于 OpenSSL TLS 1.3）。未启用 `-Dhttp3=nghttp3` 时，`advertise` 只在 HTTPS 响应中注入 `Alt-Svc: h3=":443"` 头，QUIC 流量仍需由反向代理承接。
-- HTTP/3 server 当前为单连接模式，每个 QUIC 连接独立完成握手和 HTTP/3 请求处理。QUIC 线程与 HTTP/HTTPS acceptor 共享 worker 池和 dispatcher。
+- HTTP/3 server 当前为实验性单活动连接模式；同一 QUIC 连接内的每个 H3 stream 使用独立请求/响应状态，并进入与 HTTP/1.1、HTTP/2 相同的 router、middleware、静态资源、页面缓存、可信客户端身份、per-IP 限流和访问日志管线。QUIC 线程同步执行 dispatch，不占用 TCP worker pool。
+- 原生 H3 当前在 END_STREAM 后分发完整请求，request body 上限为 16 KiB，响应在提交给 nghttp3 前缓冲；尚未实现 H3 增量请求/响应流。多连接 CID demux、Retry/地址验证、经验证的 NAT rebinding/path migration、优雅连接关闭和专项压测仍属于生产化工作。
 - 生产环境也可以继续放在 Caddy、nginx、HAProxy、Envoy 等 TLS 终止代理后面，由代理对外提供 TLS/ALPN/HTTP2/HTTP3，再把 HTTP/1.1 转发给 ZiServer。
 
 协议层实施计划：
@@ -414,7 +415,7 @@ JSON 字段包含 `time_unix_ms`、`level`、`event`、`protocol`、`method`、`
 6. 已接入 nghttp2 adapter：处理帧层、HPACK、并发 stream、flow control、单 stream 请求限制和 graceful GOAWAY，并把 h2 request/response 映射到现有 `Context`、middleware、router、静态资源和日志。
 7. h2c 最小实验路径可作为测试模块保留，但不作为生产默认路径。
 8. HTTP/3 advertise 模式已就绪：`--http3=advertise --http3-port=N` 可在 HTTPS 响应中注入 `Alt-Svc` 头宣告 h3 端点。
-9. HTTP/3 QUIC transport 已部分完成：`-Dhttp3=nghttp3` 编译后链接 ngtcp2 + nghttp3，创建 QUIC/UDP listener，完成 TLS 1.3 QUIC 握手、HTTP/3 帧解析和响应编码。当前为单连接模式，后续需补充多连接、GOAWAY 和完整 router 集成。
+9. HTTP/3 实验套件已接入：`-Dhttp3=nghttp3` 编译后链接 ngtcp2 + nghttp3，创建 QUIC/UDP listener，完成 TLS 1.3 + `h3` ALPN、HTTP/3 帧/QPACK、per-stream 状态、应用响应编码，并复用现有 router/middleware/client identity。后续需补多连接、原生流式 body/response、Retry/path validation、优雅关闭和专项压测。
 
 ## 路由框架规划
 

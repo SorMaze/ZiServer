@@ -25,10 +25,10 @@ This list is based on the current source, build options, tests, and public docum
 
 ## P1: Protocol and cache completeness
 
-5. **Production HTTP/3**: expand the experimental single-connection mode to multiple connections, graceful GOAWAY/close, full router/middleware integration, and dedicated load testing.
+5. **Production HTTP/3**: expand the experimental single-active-connection adapter to CID-demultiplexed multiple connections, native incremental request/response streaming, Retry/address validation, validated path migration, graceful GOAWAY/close, and dedicated load testing. Router/middleware/cache/client-identity integration is complete for the buffered experimental path.
 6. **Cache invalidation and representation dimensions**: add path/tag purge, allow only allowlisted `Vary` dimensions, and define multi-process consistency strategy.
 7. **Static-resource HTTP semantics**: add ETag/Last-Modified, conditional requests, Range, and precompressed gzip/brotli selection.
-8. **Real client identity boundary (complete)**: socket peer addresses flow through HTTP/1.1 and HTTP/2; forwarded headers are ignored by default; explicit trusted-proxy CIDRs, bounded XFF parsing, normalized client IP, per-IP limiting, and aggregate metrics are integrated. Native HTTP/3 must reuse this boundary when router/middleware integration is complete.
+8. **Real client identity boundary (complete)**: socket peer addresses flow through HTTP/1.1, HTTP/2, and the experimental HTTP/3 path; forwarded headers are ignored by default; explicit trusted-proxy CIDRs, bounded XFF parsing, normalized client IP, per-IP limiting, and aggregate metrics are integrated. HTTP/3 path migration remains disabled until ngtcp2-validated active-path updates can be propagated safely.
 
 ## P2: Production operations and quality gates
 

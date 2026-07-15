@@ -80,6 +80,7 @@ pub const Context = struct {
     response_written: bool = false,
     response_headers: [max_response_headers]response.Header = undefined,
     response_headers_len: usize = 0,
+    cache_transparent_headers_len: usize = 0,
     cache_override: ?response.CachePolicy = null,
     page_cache_store: ?*page_cache.Store,
     page_cache_policy: page_cache.Policy = .none,
@@ -258,6 +259,13 @@ pub const Context = struct {
         self.response_headers_len += 1;
     }
 
+    /// Adds a connection-level header that is regenerated for cache hits and
+    /// therefore does not make an otherwise cacheable response vary.
+    pub fn addTransportHeader(self: *Context, name: []const u8, value: []const u8) !void {
+        try self.addHeader(name, value);
+        self.cache_transparent_headers_len += 1;
+    }
+
     pub fn setCachePolicy(self: *Context, cache: response.CachePolicy) void {
         self.cache_override = cache;
     }
@@ -328,7 +336,7 @@ pub const Context = struct {
         self.response_cache_policy = effective_cache;
         self.recordResponse(status, if (head) 0 else body.len);
         if (self.page_cache_fill and !head and status.code == response.Status.ok.code and
-            self.pendingHeaders().len == 0 and extra_headers.len == 0)
+            self.pendingHeaders().len == self.cache_transparent_headers_len and extra_headers.len == 0)
         {
             self.page_cache_fill = false;
             if (self.page_cache_store) |store| {
@@ -429,7 +437,7 @@ pub const Context = struct {
     }
 };
 
-test "context fills page cache only for header-free successful GET" {
+test "context fills page cache with a cache-transparent transport header" {
     const page_cache_mod = @import("page_cache.zig");
 
     var store = try page_cache_mod.Store.init(std.testing.allocator, .{});
@@ -457,6 +465,7 @@ test "context fills page cache only for header-free successful GET" {
     const fill_key = page_cache_mod.requestKey(request, &key_buffer_for_fill).?;
     const fill = try store.beginFill(std.testing.io, fill_key, std.Io.Clock.awake.now(std.testing.io).nanoseconds);
     ctx.enablePageCacheFill(.standard, fill.leader);
+    try ctx.addTransportHeader("Alt-Svc", "h3=\":443\"");
     try std.testing.expectEqual(log.CacheStatus.miss, ctx.page_cache_status);
     try ctx.html(.ok, "body");
     try std.testing.expectEqual(log.CacheStatus.fill, ctx.page_cache_status);
@@ -467,4 +476,13 @@ test "context fills page cache only for header-free successful GET" {
     const hit = store.acquire(std.testing.io, key, std.Io.Clock.awake.now(std.testing.io).nanoseconds).?;
     defer hit.deinit();
     try std.testing.expectEqualStrings("body", hit.body());
+
+    var found_alt_svc = false;
+    for (capture.headers[0..capture.headers_len]) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name_ptr[0..header.name_len], "Alt-Svc")) {
+            found_alt_svc = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_alt_svc);
 }

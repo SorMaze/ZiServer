@@ -18,6 +18,7 @@ pub const Application = @import("core/http.zig").Application;
 pub const ApplicationBundle = @import("core/http.zig").ApplicationBundle;
 
 pub const http2 = @import("core/http2.zig");
+pub const http3 = @import("core/http3.zig");
 pub const http_config = @import("core/http_config.zig");
 pub const ApplicationStartupConfig = http_config.ApplicationStartupConfig;
 pub const protocol = @import("core/protocol.zig");

@@ -310,7 +310,7 @@ The active protocol surface is plaintext HTTP/1.0/1.1, HTTPS/HTTP/1.1, HTTPS/HTT
 - h2c and `HTTP/2.0` request lines return 505. ALPN selects `h2` only when TLS termination and nghttp2 are active; clients otherwise fall back to HTTP/1.1.
 - HTTP/2 advertises a 4 KiB HPACK table, 128 concurrent streams, a 256 KiB initial per-stream receive window, and a 4 KiB header-list limit. Bodies still flow through a bounded 16 KiB queue.
 - HTTP/2 requests are copied into Zig concurrent tasks while all nghttp2 session submission/socket writes stay on one session thread. Stream-local 431/413, RST cancellation, early-response DATA drain, request-count GOAWAY, and graceful shutdown are supported.
-- Native HTTP/3 currently uses a single-connection mode through ngtcp2/nghttp3 and OpenSSL QUIC TLS 1.3. Multi-connection production hardening, GOAWAY, and full router integration remain roadmap items.
+- Native HTTP/3 currently uses an experimental single-active-connection adapter through ngtcp2/nghttp3 and OpenSSL QUIC TLS 1.3. Each H3 stream has independent request/response state and enters the same router, middleware, static, cache, trusted-client-identity, rate-limit, and access-log pipeline. The adapter buffers request bodies up to 16 KiB and buffers responses before submitting them to nghttp3; native incremental H3 streaming is not implemented yet. Multi-connection CID demultiplexing, Retry/address validation, validated path migration, graceful connection close, and dedicated load testing remain production roadmap items.
 
 An external Caddy, nginx, HAProxy, or Envoy may continue to terminate TLS/ALPN/HTTP2/HTTP3 and forward HTTP/1.1 to ZiServer.
 

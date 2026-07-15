@@ -190,8 +190,9 @@ static int ziserver_openssl_select_alpn(
     unsigned int inlen,
     void *arg
 ) {
-    (void)ssl;
-    (void)arg;
+    static const unsigned char h3[] = {
+        2, 'h', '3'
+    };
     static const unsigned char http11[] = {
         8, 'h', 't', 't', 'p', '/', '1', '.', '1'
     };
@@ -199,13 +200,14 @@ static int ziserver_openssl_select_alpn(
         2, 'h', '2',
         8, 'h', 't', 't', 'p', '/', '1', '.', '1'
     };
-    const unsigned char *protocols = arg == NULL ? http11 : h2_http11;
-    unsigned int protocols_len = arg == NULL ? sizeof(http11) : sizeof(h2_http11);
+    const int is_quic = SSL_is_quic(ssl);
+    const unsigned char *protocols = is_quic ? h3 : (arg == NULL ? http11 : h2_http11);
+    unsigned int protocols_len = is_quic ? sizeof(h3) : (arg == NULL ? sizeof(http11) : sizeof(h2_http11));
 
     if (SSL_select_next_proto((unsigned char **)out, outlen, protocols, protocols_len, in, inlen) == OPENSSL_NPN_NEGOTIATED) {
         return SSL_TLSEXT_ERR_OK;
     }
-    return SSL_TLSEXT_ERR_NOACK;
+    return is_quic ? SSL_TLSEXT_ERR_ALERT_FATAL : SSL_TLSEXT_ERR_NOACK;
 }
 
 unsigned long ziserver_openssl_version_number(void) {

@@ -20,10 +20,10 @@
 
 ## P1：协议与缓存完整性
 
-5. **HTTP/3 生产化**：从实验性单连接扩展到多连接、优雅 GOAWAY/关闭、完整 router/middleware 集成和独立压力测试。
+5. **HTTP/3 生产化**：从实验性单活动连接扩展到按 CID demux 的多连接、原生增量请求/响应流、Retry/地址验证、经验证的 path migration、优雅 GOAWAY/关闭和独立压力测试。缓冲实验路径已完成 router/middleware/cache/client identity 集成。
 6. **缓存失效与表示维度**：提供 path/tag purge；只允许白名单 `Vary`；明确部署时的多进程一致性策略。
 7. **静态资源 HTTP 语义**：增加 ETag/Last-Modified、条件请求、Range，以及预压缩 gzip/brotli 选择，减少重复传输。
-8. **真实客户端身份边界（已完成）**：socket peer 地址贯穿 HTTP/1.1/HTTP/2，默认忽略转发头；显式可信代理 CIDR、有界 XFF 解析、规范化 client IP、per-IP 限流及聚合指标已经接入。原生 HTTP/3 完成 router/middleware 集成时仍需复用该边界。
+8. **真实客户端身份边界（已完成）**：socket peer 地址贯穿 HTTP/1.1、HTTP/2 和实验性 HTTP/3，默认忽略转发头；显式可信代理 CIDR、有界 XFF 解析、规范化 client IP、per-IP 限流及聚合指标已经接入。HTTP/3 path migration 暂不启用，直到能够安全传播 ngtcp2 验证后的活动 path 更新。
 
 ## P2：生产运维与质量门禁
 

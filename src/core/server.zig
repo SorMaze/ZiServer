@@ -11,13 +11,16 @@ const page_cache = @import("page_cache.zig");
 const protocol_redirect = @import("protocol_redirect.zig");
 const quic_transport = @import("quic_transport.zig");
 const rate_limiter_mod = @import("rate_limiter.zig");
-const response_mod = @import("response.zig");
 const shutdown = @import("shutdown.zig");
 const static = @import("static.zig");
 const stats_mod = @import("stats.zig");
 const stream_queue = @import("stream_queue.zig");
 const tls = @import("tls.zig");
 const transport = @import("transport.zig");
+
+const worker_thread_stack_size = 2 * 1024 * 1024;
+const acceptor_thread_stack_size = 512 * 1024;
+const quic_thread_stack_size = 2 * 1024 * 1024;
 
 const net = std.Io.net;
 
@@ -261,24 +264,24 @@ fn run(
     };
 
     for (worker_threads, 0..) |*thread, i| {
-        thread.* = try std.Thread.spawn(.{}, workerLoop, .{ &shared, i });
+        thread.* = try std.Thread.spawn(.{ .stack_size = worker_thread_stack_size }, workerLoop, .{ &shared, i });
         started_workers += 1;
     }
     var acceptor_index: usize = 0;
     for (0..http_acceptors) |_| {
-        acceptor_threads[acceptor_index] = try std.Thread.spawn(.{}, acceptLoop, .{&http_acceptor});
+        acceptor_threads[acceptor_index] = try std.Thread.spawn(.{ .stack_size = acceptor_thread_stack_size }, acceptLoop, .{&http_acceptor});
         acceptor_index += 1;
         started_http_acceptors += 1;
     }
     for (0..https_acceptors) |_| {
-        acceptor_threads[acceptor_index] = try std.Thread.spawn(.{}, acceptLoop, .{&https_acceptor});
+        acceptor_threads[acceptor_index] = try std.Thread.spawn(.{ .stack_size = acceptor_thread_stack_size }, acceptLoop, .{&https_acceptor});
         acceptor_index += 1;
         started_https_acceptors += 1;
     }
 
     var quic_thread: std.Thread = undefined;
     if (http3_socket_open) {
-        quic_thread = try std.Thread.spawn(.{}, quicAcceptLoop, .{ &shared, &http3_socket });
+        quic_thread = try std.Thread.spawn(.{ .stack_size = quic_thread_stack_size }, quicAcceptLoop, .{ &shared, &http3_socket });
     }
     startup_complete = true;
 
@@ -310,9 +313,9 @@ fn run(
         https_listener_open = false;
     }
     if (http3_socket_open) {
+        quic_thread.join();
         http3_socket.deinit();
         http3_socket_open = false;
-        quic_thread.join();
     }
 
     const grace_ns = @as(i96, config.shutdown_grace_ms) * std.time.ns_per_ms;
@@ -579,16 +582,31 @@ fn workerLoop(shared: *SharedServer, worker_index: usize) void {
 
 fn quicAcceptLoop(shared: *SharedServer, socket: *quic_transport.Socket) void {
     const ssl_handle: ?*anyopaque = if (shared.tls_context) |ctx| ctx.handle else null;
-
-    // Bridge: the C adapter sends a fixed JSON response via nghttp3;
-    // the dispatch fn just signals success (0 = OK, -1 = error).
-    const dispatch = struct {
-        fn dispatch(_: ?*anyopaque, _: *const http3.Request, _: *response_mod.Capture) anyerror!void {}
-    }.dispatch;
+    var dispatch_state = http.Http3DispatchState{
+        .io = shared.io,
+        .stats = shared.stats,
+        .static_store = shared.static_store,
+        .app = shared.application,
+        .access_log_enabled = shared.access_log_enabled,
+        .identity_resolver = shared.identity_resolver,
+    };
 
     while (!shared.stopping.load(.acquire)) {
-        _ = http3.serve(socket, null, dispatch, shared.keep_alive_requests, ssl_handle) catch {
+        const summary = http3.serve(
+            socket,
+            &dispatch_state,
+            http.dispatchHttp3Request,
+            shared.keep_alive_requests,
+            ssl_handle,
+            shared.stopping,
+        ) catch {
             std.Io.sleep(shared.io, .{ .nanoseconds = 10 * std.time.ns_per_ms }, .awake) catch {};
+            continue;
         };
+        logger.message(shared.io, .info, "http3_session_closed", "protocol=h3 requests={d} highest_stream_id={d} goaway={s}", .{
+            summary.requests,
+            summary.highest_stream_id,
+            if (summary.sentGoaway()) "yes" else "no",
+        });
     }
 }
