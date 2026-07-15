@@ -133,8 +133,11 @@ JSON fields include `time_unix_ms`, `level`, `event`, `protocol`, `method`, `pat
 - `--page-cache-ttl-percent=N`: global DSL TTL scaling, default 100, range 1–1000.
 - `--page-cache-header=on|off`: emit `X-Page-Cache: HIT`, off by default.
 - `--page-cache-fill-wait-timeout=MS`: maximum same-key miss coalescing wait, default 100; `0` bypasses immediately.
+- `--page-cache-prewarm=on|off`: asynchronously render exact public `.static_shared` routes at startup, on by default; `--no-page-cache-prewarm` disables it.
 
-Use `z.layer.pageCache(...)` only for deterministic anonymous GET pages with meaningful generation cost. `z.layer.cache(...)` controls browser/proxy `Cache-Control`; the two layers have separate responsibilities. Query strings are part of the key. Authentication, Cookie, Origin, Range, `no-cache/no-store`, and custom response headers conservatively bypass. Watch `/stats` hit ratio, evictions, bytes, fill leaders/waits/hits/bypasses/timeouts. Full behavior is documented in [page-cache design](docs/en/architecture/page-cache.md).
+Prefer the atomic `z.layer.cacheStrategy(...)` DSL: `.static_shared`, `.recommended`, `.discouraged`, or `.never`. Recommended pages partition cache keys by a SHA-256 digest of Cookie state and emit `Vary: Cookie`; static shared pages explicitly ignore Cookie for maximum reuse. Authorization, Origin, Range, `no-cache/no-store`, and custom response headers still conservatively bypass. The lower-level `cache(...)` and `pageCache(...)` layers remain available. Test the modes through `/cache-arena/{static-shared,recommended,discouraged,never}` and watch `/stats` hit ratio, evictions, bytes, fill leaders/waits/hits/bypasses/timeouts. Full behavior is documented in [page-cache design](docs/en/architecture/page-cache.md).
+
+Startup prewarming runs in a managed background thread after the listeners and workers are ready. It automatically discovers exact unauthenticated GET routes declared as `.static_shared`, renders them through the application middleware/handler pipeline without consuming client rate-limit budget, and inserts successful cacheable responses into the normal page-cache store. Host keys are generated from the canonical host, every allowed host, or a concrete bind host; wildcard binds without a configured host are skipped. Set `ZISERVER_PAGE_CACHE_PREWARM=off` or use the CLI switch above to disable it.
 
 For throughput tests, use `--no-access-log --page-cache-header=off` so synchronous logs and diagnostic headers are not counted as generation cost.
 
@@ -238,8 +241,7 @@ pub const registry = z.handlers(.{ home, submit, apiEcho, uploadHandler });
 
 const public_pages = z.group(.{
     .layers = z.layers(.{
-        z.layer.cache(.api_short),
-        z.layer.pageCache(.standard),
+        z.layer.cacheStrategy(.static_shared),
         z.layer.cors(.public_read),
         z.layer.rate(.relaxed),
     }),

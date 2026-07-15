@@ -94,6 +94,7 @@ zig-out\bin\ziserver.exe --static-dir=zig-out\public
 - `--page-cache-ttl-percent=N`: 全局缩放 DSL TTL，默认 100，范围 1–1000
 - `--page-cache-header=on|off`: 命中时是否输出 `X-Page-Cache: HIT`，默认 off
 - `--page-cache-fill-wait-timeout=MS`: 同 key miss 合并最长等待，默认 100；设为 0 直接绕过
+- `--page-cache-prewarm=on|off`: 启动时异步渲染精确的公共 `.static_shared` 路由，默认 on；可用 `--no-page-cache-prewarm` 关闭
 - `--static=embedded|filesystem`: 静态资源提供模式，默认由构建参数决定
 - `--static-dir=DIR`: filesystem 模式下的静态资源根目录，默认 `public`
 - `--auth-token=TOKEN`: 配置 Bearer auth token
@@ -245,8 +246,9 @@ zig-out\bin\ziserver.exe --acceptors=4 --workers=64 --queue=32768 --shards=4 --b
 
 ### 页面缓存最佳实践
 
-- 只给确定性、匿名、生成成本明显的 GET 页面添加 `z.layer.pageCache(...)`。当前示例页面只有一次栈上格式化，缓存收益约 2–3%；数据库查询、模板组合或序列化更重的页面才会获得更明显收益。
-- `z.layer.cache(...)` 控制浏览器/代理的 `Cache-Control`，`z.layer.pageCache(...)` 控制 ZiServer 进程内 L1，两者职责不同，通常需要分别声明。
+- 优先使用原子化 `z.layer.cacheStrategy(...)`：`.static_shared`、`.recommended`、`.discouraged` 或 `.never`。`.recommended` 按 Cookie 的 SHA-256 摘要分区并发送 `Vary: Cookie`；`.static_shared` 显式忽略 Cookie，以提高确定性公共页面的复用率。
+- 底层 `z.layer.cache(...)` 与 `z.layer.pageCache(...)` 仍可用于特殊策略。可通过 `/cache-arena/{static-shared,recommended,discouraged,never}` 实测四种行为。
+- 启动预热默认开启。listener 和 worker 就绪后，受生命周期管理的后台线程会自动扫描精确、非鉴权的 GET `.static_shared` 路由，通过正常 middleware/handler 管线渲染并写入同一个页面缓存，但不消耗客户端限流预算。Host key 优先使用 canonical host，其次覆盖所有 allowed host，最后使用非 wildcard bind host；wildcard 且未配置 Host policy 时会明确跳过。可通过 `ZISERVER_PAGE_CACHE_PREWARM=off` 或 `--page-cache-prewarm=off` 关闭。
 - 默认从 256 entries / 16 shards 开始。热点 key 多、worker 多时再提高 shard；容量增大但 shard 不变会增加 shard 内查找长度。
 - 用 `/stats` 观察 `hits / (hits + misses)`、`evictions` 和 `bytes`。命中率低且 entries 持续增长通常表示 query 基数过高或路由不适合整页缓存。
 - query 是缓存键的一部分。搜索、筛选和带随机追踪参数的页面应规范化 query，或不要启用整页缓存，避免缓存污染。
@@ -254,7 +256,7 @@ zig-out\bin\ziserver.exe --acceptors=4 --workers=64 --queue=32768 --shards=4 --b
 - 用 `fill_leaders`、`coalesced_waits`、`coalesced_hits` 判断击穿合并效果；`fill_bypasses` 持续增长表示单个 shard 同时填充过多不同 key，应提高 shard/capacity 或降低高基数路由的缓存范围。
 - `X-Page-Cache` 默认关闭以减少热路径工作；排查时临时启用 `--page-cache-header=on`，不要把它当作长期性能指标。
 - 纯吞吐 benchmark 同时使用 `--no-access-log --page-cache-header=off`。生产环境是否关闭访问日志应依据上游日志方案决定。
-- 认证、Cookie、Origin、Range、`no-cache/no-store` 和带自定义响应 header 的请求会保守绕过，避免跨用户或跨表示共享。
+- 认证、Origin、Range、`no-cache/no-store` 和带自定义响应 header 的请求会保守绕过；`.recommended` 按 Cookie 摘要隔离，只有显式 `.static_shared` 才跨 Cookie 共享。
 
 模块结构：
 
@@ -443,8 +445,7 @@ const upload_policy: z.UploadPolicy = .{
 
 const public_pages = z.group(.{
     .layers = z.layers(.{
-        z.layer.cache(.api_short),
-        z.layer.pageCache(.standard),
+        z.layer.cacheStrategy(.static_shared),
         z.layer.cors(.public_read),
         z.layer.rate(.relaxed),
     }),
@@ -606,7 +607,7 @@ zig build run -- --auth-token=local-token --api-key=local-key
 - Query 参数结构化解析：已由 `src/core/query.zig` 提供，只读键值视图支持重复 key、空值、裸 key、`%XX` 校验和按需解码；handler 可通过 `ctx.queryParam("name")` 读取首个值。
 - 中间件/拦截器：已接入 handler 前置 pipeline，`host_guard`、`xss`、`cors`、`auth`、`rate_limit`、`query_guard` 等组件分别维护和执行。XSS 支持 `off`、`observe`、`block`，服务器级配置作为最低策略，路由可通过 `xssObserve/xssBlock` 进一步加强；query/body 扫描目标可独立配置。用户侧可以通过 `z.layer.middleware()` 声明自定义执行中间件，并用 `z.middlewareStackWithDefaults()` 扩展默认栈。
 - Handler 统一接口：已引入 `Context`，动态 handler 统一由 `z.handlers()` 生成的 `registry.dispatch(ctx, handler)` 执行；handler/middleware 失败时返回统一语义错误，由 core 错误出口写响应。`Context` 同时提供 `html/text/json` 响应糖，方便写最小动态站点。
-- 路由级配置：每条路由可以通过 `z.layer.auth()`、`bodyLimit()`、`content/extract/inject()`、兼容接口 `jsonBody/jsonBodyLimit()`、`upload/smallFileUpload/streamFileUpload()`、`database()`、`cache/pageCache()`、`cors()`、`rate()`、`requireAuth()` 和 `xssObserve/xssBlock()` 声明策略；也可以通过 route group 设置默认 layer。文件、codec 与数据库副作用只有显式 layer/service 才会启用。
+- 路由级配置：每条路由可以通过 `z.layer.auth()`、`bodyLimit()`、`content/extract/inject()`、兼容接口 `jsonBody/jsonBodyLimit()`、`upload/smallFileUpload/streamFileUpload()`、`database()`、`cacheStrategy()`、底层 `cache/pageCache()`、`cors()`、`rate()`、`requireAuth()` 和 `xssObserve/xssBlock()` 声明策略；也可以通过 route group 设置默认 layer。文件、codec 与数据库副作用只有显式 layer/service 才会启用。
 - 错误处理统一化：404、405、415、413、400、401、403、500 等错误由 `core/errors.zig` 统一生成，业务 handler 和中间件只返回语义错误。
 
 建议分三步落地：

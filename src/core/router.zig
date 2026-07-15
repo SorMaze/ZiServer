@@ -22,6 +22,7 @@ pub const Options = struct {
     require_auth: bool = false,
     middleware_flags: u32 = 0,
     page_cache: page_cache.Policy = .none,
+    cache_strategy: ?page_cache.Strategy = null,
     upload: ?http_config.UploadPolicy = null,
     upload_landing: http_config.UploadLanding = .none,
     streaming_body: bool = false,

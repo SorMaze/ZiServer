@@ -33,6 +33,7 @@ pub const default_middleware_stack = compose.default_middleware_stack;
 pub const middleware = @import("core/middleware.zig");
 pub const page_cache = @import("core/page_cache.zig");
 pub const PageCachePolicy = page_cache.Policy;
+pub const CacheStrategy = page_cache.Strategy;
 pub const auth = @import("compose/auth.zig");
 pub const form = @import("compose/form.zig");
 pub const json_body = @import("compose/json_body.zig");

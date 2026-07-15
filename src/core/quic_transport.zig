@@ -1,6 +1,12 @@
 const std = @import("std");
+const socket_read = @import("socket_read.zig");
 
 pub const net = std.Io.net;
+
+pub const Datagram = struct {
+    len: usize,
+    from: net.IpAddress,
+};
 
 pub const Socket = struct {
     io: std.Io,
@@ -18,7 +24,7 @@ pub const Socket = struct {
         self.* = undefined;
     }
 
-    pub fn recvFrom(self: *Socket) !struct { len: usize, from: net.IpAddress } {
+    pub fn recvFrom(self: *Socket) !Datagram {
         const msg = self.inner.receive(self.io, self.recv_buf[0..]) catch |err| {
             return err;
         };
@@ -26,20 +32,9 @@ pub const Socket = struct {
         return .{ .len = msg.data.len, .from = msg.from };
     }
 
-    pub fn recvFromTimeout(self: *Socket, timeout_ms: u32) !?struct { len: usize, from: net.IpAddress } {
-        const msg = self.inner.receiveTimeout(
-            self.io,
-            self.recv_buf[0..],
-            .{ .duration = .{
-                .raw = .{ .nanoseconds = @as(i64, timeout_ms) * std.time.ns_per_ms },
-                .clock = .awake,
-            } },
-        ) catch |err| switch (err) {
-            error.Timeout => return null,
-            else => return err,
-        };
-        self.last_peer = msg.from;
-        return .{ .len = msg.data.len, .from = msg.from };
+    pub fn recvFromTimeout(self: *Socket, timeout_ms: u32) !?Datagram {
+        if (!try socket_read.waitReadable(self.inner.handle, @max(timeout_ms, 1))) return null;
+        return try self.recvFrom();
     }
 
     pub fn sendTo(self: *Socket, data: []const u8, dest: net.IpAddress) !void {

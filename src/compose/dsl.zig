@@ -53,6 +53,10 @@ pub const OptionsBuilder = struct {
         return self.withLayer(layer.pageCache(next_value));
     }
 
+    pub fn cacheStrategy(self: OptionsBuilder, value: page_cache.Strategy) OptionsBuilder {
+        return self.withLayer(layer.cacheStrategy(value));
+    }
+
     pub fn upload(self: OptionsBuilder, value: http_config.UploadPolicy) OptionsBuilder {
         return self.withLayer(layer.upload(value));
     }
@@ -165,6 +169,10 @@ pub const RouteBuilder = struct {
 
     pub fn pageCache(self: RouteBuilder, value: page_cache.Policy) RouteBuilder {
         return self.withLayer(layer.pageCache(value));
+    }
+
+    pub fn cacheStrategy(self: RouteBuilder, value: page_cache.Strategy) RouteBuilder {
+        return self.withLayer(layer.cacheStrategy(value));
     }
 
     pub fn upload(self: RouteBuilder, value: http_config.UploadPolicy) RouteBuilder {
@@ -495,7 +503,7 @@ test "layers merge route options" {
         }),
         post("/submit", 2).withLayer(layer.bodyLimit(512)).withLayer(layer.xssBlock()),
         post("/api/echo", 3).withLayer(layer.jsonBodyLimit(256)),
-        get("/page", 4).withLayer(layer.pageCache(.standard)),
+        get("/page", 4).cacheStrategy(.static_shared),
         post("/upload", 5).withLayer(layer.upload(.{ .max_request_bytes = 2048, .max_file_bytes = 1024 })),
         post("/upload/store", 6).withLayer(layer.smallFileUpload(.{
             .validation = .{ .max_request_bytes = 4096, .max_file_bytes = 2048 },
@@ -516,7 +524,7 @@ test "layers merge route options" {
     try std.testing.expectEqual(@import("xss.zig").flag_block, built[1].options.middleware_flags);
     try std.testing.expectEqual(@as(usize, 256), built[2].options.body_limit.?);
     try std.testing.expect((built[2].options.middleware_flags & @import("json_body.zig").flag_validate_json_body) != 0);
-    try std.testing.expectEqual(page_cache.Policy.standard, built[3].options.page_cache);
+    try std.testing.expectEqual(page_cache.Strategy.static_shared, built[3].options.cache_strategy.?);
     try std.testing.expectEqual(@as(usize, 2048), built[4].options.body_limit.?);
     try std.testing.expectEqual(@as(usize, 1024), built[4].options.upload.?.max_file_bytes);
     try std.testing.expectEqual(@as(usize, 4096), built[5].options.body_limit.?);
@@ -558,6 +566,22 @@ test "group accepts layer defaults" {
     try std.testing.expectEqual(http_config.CachePolicy.no_cache, built[1].options.cache.?);
     try std.testing.expectEqual(http_config.CorsPolicy.public_read, built[1].options.cors);
     try std.testing.expectEqual(http_config.RateLimitPolicy.relaxed, built[1].options.rate_limit);
+}
+
+test "cache strategy arena supports group defaults and route overrides" {
+    const built = routes(.{
+        group(.{
+            .prefix = "/cache-arena",
+            .layers = layers(.{layer.cacheStrategy(.static_shared)}),
+            .routes = .{
+                get("/shared", 1),
+                get("/never", 2).cacheStrategy(.never),
+            },
+        }),
+    });
+
+    try std.testing.expectEqual(page_cache.Strategy.static_shared, built[0].options.cache_strategy.?);
+    try std.testing.expectEqual(page_cache.Strategy.never, built[1].options.cache_strategy.?);
 }
 
 test "middleware stack extracts executable layers" {
@@ -659,6 +683,7 @@ fn mergeOptions(defaults: router.Options, overrides: router.Options) router.Opti
         .require_auth = defaults.require_auth or overrides.require_auth,
         .middleware_flags = defaults.middleware_flags | overrides.middleware_flags,
         .page_cache = if (overrides.page_cache != .none) overrides.page_cache else defaults.page_cache,
+        .cache_strategy = overrides.cache_strategy orelse defaults.cache_strategy,
         .upload = overrides.upload orelse defaults.upload,
         .upload_landing = switch (overrides.upload_landing) {
             .none => defaults.upload_landing,

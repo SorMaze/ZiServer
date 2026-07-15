@@ -20,6 +20,47 @@ pub const Policy = enum {
     }
 };
 
+pub const Scope = enum {
+    cookie_partitioned,
+    shared,
+};
+
+pub const Strategy = enum {
+    static_shared,
+    recommended,
+    discouraged,
+    never,
+
+    pub const Profile = struct {
+        policy: Policy,
+        scope: Scope,
+        response_cache: response.CachePolicy,
+    };
+
+    pub fn profile(self: Strategy) Profile {
+        return switch (self) {
+            .static_shared => .{ .policy = .long, .scope = .shared, .response_cache = .static_asset },
+            .recommended => .{ .policy = .standard, .scope = .cookie_partitioned, .response_cache = .api_short },
+            .discouraged => .{ .policy = .none, .scope = .cookie_partitioned, .response_cache = .no_cache },
+            .never => .{ .policy = .none, .scope = .cookie_partitioned, .response_cache = .no_store },
+        };
+    }
+};
+
+test "cache strategy arena maps every strategy atomically" {
+    try std.testing.expectEqual(Policy.long, Strategy.static_shared.profile().policy);
+    try std.testing.expectEqual(Scope.shared, Strategy.static_shared.profile().scope);
+    try std.testing.expectEqual(response.CachePolicy.static_asset, Strategy.static_shared.profile().response_cache);
+    try std.testing.expectEqual(Policy.standard, Strategy.recommended.profile().policy);
+    try std.testing.expectEqual(Scope.cookie_partitioned, Strategy.recommended.profile().scope);
+    try std.testing.expectEqual(response.CachePolicy.api_short, Strategy.recommended.profile().response_cache);
+    try std.testing.expectEqual(Policy.none, Strategy.discouraged.profile().policy);
+    try std.testing.expectEqual(response.CachePolicy.no_cache, Strategy.discouraged.profile().response_cache);
+    try std.testing.expectEqual(Policy.none, Strategy.never.profile().policy);
+    try std.testing.expectEqual(response.CachePolicy.no_store, Strategy.never.profile().response_cache);
+    try std.testing.expectEqualStrings("no-store", Strategy.never.profile().response_cache.value().?);
+}
+
 pub const default_capacity: usize = 256;
 pub const default_shards: usize = 16;
 pub const default_max_body_bytes: usize = 256 * 1024;
@@ -243,6 +284,19 @@ pub const Store = struct {
         return null;
     }
 
+    /// Checks for a live entry without changing hit/miss or recency metrics.
+    pub fn contains(self: *Store, io: std.Io, key: []const u8, now_ns: i96) bool {
+        const shard = &self.shards[self.shardIndex(key)];
+        shard.lock.lockSharedUncancelable(io);
+        defer shard.lock.unlockShared(io);
+
+        for (shard.entries) |slot| {
+            const entry = slot orelse continue;
+            if (entry.expires_ns > now_ns and std.mem.eql(u8, entry.key, key)) return true;
+        }
+        return false;
+    }
+
     pub fn put(
         self: *Store,
         io: std.Io,
@@ -453,6 +507,16 @@ pub fn requestKey(request: request_mod.Request, buffer: []u8) ?[]const u8 {
     return buildKey(host, request.target, buffer);
 }
 
+pub fn requestKeyForScope(request: request_mod.Request, scope: Scope, buffer: []u8) ?[]const u8 {
+    const host = request.header("Host") orelse "";
+    if (scope == .shared) return buildKey(host, request.target, buffer);
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    if (!cookieDigest(request, &digest)) return buildKey(host, request.target, buffer);
+    const encoded = std.fmt.bytesToHex(digest, .lower);
+    return buildPartitionedKey(host, request.target, &encoded, buffer);
+}
+
 pub fn buildKey(host: []const u8, target: []const u8, buffer: []u8) ?[]const u8 {
     const required = host.len + 1 + target.len;
     if (required > buffer.len or required > max_key_bytes) return null;
@@ -460,6 +524,66 @@ pub fn buildKey(host: []const u8, target: []const u8, buffer: []u8) ?[]const u8 
     buffer[host.len] = '\n';
     @memcpy(buffer[host.len + 1 .. required], target);
     return buffer[0..required];
+}
+
+fn buildPartitionedKey(host: []const u8, target: []const u8, partition: []const u8, buffer: []u8) ?[]const u8 {
+    const marker = "\ncookie-sha256=";
+    const required = host.len + 1 + target.len + marker.len + partition.len;
+    if (required > buffer.len or required > max_key_bytes) return null;
+    for (host, 0..) |byte, index| buffer[index] = std.ascii.toLower(byte);
+    buffer[host.len] = '\n';
+    var cursor = host.len + 1;
+    @memcpy(buffer[cursor..][0..target.len], target);
+    cursor += target.len;
+    @memcpy(buffer[cursor..][0..marker.len], marker);
+    cursor += marker.len;
+    @memcpy(buffer[cursor..][0..partition.len], partition);
+    return buffer[0..required];
+}
+
+fn cookieDigest(request: request_mod.Request, digest: *[std.crypto.hash.sha2.Sha256.digest_length]u8) bool {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var found = false;
+    var rest = request.headers;
+    while (rest.len != 0) {
+        const line_end = std.mem.indexOf(u8, rest, "\r\n") orelse rest.len;
+        const line = rest[0..line_end];
+        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
+            const name = std.mem.trim(u8, line[0..colon], " \t");
+            if (std.ascii.eqlIgnoreCase(name, "Cookie")) {
+                if (found) hasher.update("\x00");
+                hasher.update(std.mem.trim(u8, line[colon + 1 ..], " \t"));
+                found = true;
+            }
+        }
+        if (line_end == rest.len) break;
+        rest = rest[line_end + 2 ..];
+    }
+    if (found) hasher.final(digest);
+    return found;
+}
+
+test "page cache keys partition cookies unless the route is shared" {
+    const plain = try request_mod.Request.parse("GET /about HTTP/1.1\r\nHost: Example.COM\r\n\r\n");
+    const cookie_a = try request_mod.Request.parse("GET /about HTTP/1.1\r\nHost: example.com\r\nCookie: session=a\r\n\r\n");
+    const cookie_a_again = try request_mod.Request.parse("GET /about HTTP/1.1\r\nHost: EXAMPLE.COM\r\nCookie: session=a\r\n\r\n");
+    const cookie_b = try request_mod.Request.parse("GET /about HTTP/1.1\r\nHost: example.com\r\nCookie: session=b\r\n\r\n");
+
+    var plain_buffer: [max_key_bytes]u8 = undefined;
+    var cookie_a_buffer: [max_key_bytes]u8 = undefined;
+    var cookie_a_again_buffer: [max_key_bytes]u8 = undefined;
+    var cookie_b_buffer: [max_key_bytes]u8 = undefined;
+    var shared_buffer: [max_key_bytes]u8 = undefined;
+    const plain_key = requestKeyForScope(plain, .cookie_partitioned, &plain_buffer).?;
+    const cookie_a_key = requestKeyForScope(cookie_a, .cookie_partitioned, &cookie_a_buffer).?;
+    const cookie_a_again_key = requestKeyForScope(cookie_a_again, .cookie_partitioned, &cookie_a_again_buffer).?;
+    const cookie_b_key = requestKeyForScope(cookie_b, .cookie_partitioned, &cookie_b_buffer).?;
+    const shared_key = requestKeyForScope(cookie_b, .shared, &shared_buffer).?;
+
+    try std.testing.expectEqualStrings(cookie_a_key, cookie_a_again_key);
+    try std.testing.expect(!std.mem.eql(u8, plain_key, cookie_a_key));
+    try std.testing.expect(!std.mem.eql(u8, cookie_a_key, cookie_b_key));
+    try std.testing.expectEqualStrings(plain_key, shared_key);
 }
 
 test "page cache stores, hits, replaces, and expires entries" {

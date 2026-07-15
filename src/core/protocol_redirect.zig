@@ -85,6 +85,24 @@ pub fn validateConfiguredHost(value: []const u8) !void {
     try validateDnsName(value);
 }
 
+/// Formats a validated configured host as an HTTP authority. IP literals are
+/// normalized and IPv6 is bracketed. Standard ports may be omitted so the
+/// generated value matches browser Host headers.
+pub fn formatConfiguredAuthority(
+    buffer: []u8,
+    value: []const u8,
+    port: u16,
+    omit_port: bool,
+) ![]const u8 {
+    if (port == 0) return error.InvalidRedirectDestination;
+    var host_buffer: [256]u8 = undefined;
+    const host = try formatConfiguredHost(&host_buffer, value);
+    return if (omit_port)
+        std.fmt.bufPrint(buffer, "{s}", .{host}) catch error.RedirectLocationTooLong
+    else
+        std.fmt.bufPrint(buffer, "{s}:{d}", .{ host, port }) catch error.RedirectLocationTooLong;
+}
+
 fn resolveHost(buffer: []u8, authority: []const u8, policy: HostPolicy) ![]const u8 {
     const request_host = try hostWithoutPort(authority);
     var matched_allowed: ?[]const u8 = null;
@@ -212,6 +230,18 @@ test "redirect location replaces wrong listener port and preserves target" {
     try std.testing.expectEqualStrings(
         "http://[2001:db8:0:0:0:0:0:1]:18080/",
         try resolveLocation(&buffer, "[2001:db8::1]:18443", "/", .{ .scheme = .http, .port = 18080 }, .{ .allowed_hosts = &.{"2001:db8::1"} }),
+    );
+}
+
+test "configured authority normalizes IPv6 and optional standard ports" {
+    var buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "[0:0:0:0:0:0:0:1]:18443",
+        try formatConfiguredAuthority(&buffer, "::1", 18443, false),
+    );
+    try std.testing.expectEqualStrings(
+        "example.test",
+        try formatConfiguredAuthority(&buffer, "example.test", 443, true),
     );
 }
 

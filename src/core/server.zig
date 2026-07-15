@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const client_identity = @import("client_identity.zig");
+const cache_prewarm = @import("cache_prewarm.zig");
 const config_mod = @import("config.zig");
 const http = @import("http.zig");
 const http2 = @import("http2.zig");
@@ -285,6 +286,21 @@ fn run(
     }
     startup_complete = true;
 
+    var prewarm_thread: ?std.Thread = null;
+    if (config.page_cache_enabled and config.page_cache_prewarm_enabled) {
+        prewarm_thread = std.Thread.spawn(.{ .stack_size = worker_thread_stack_size }, cache_prewarm.run, .{cache_prewarm.RunArgs{
+            .io = io,
+            .allocator = allocator,
+            .config = &config,
+            .application = application,
+            .static_store = &static_store,
+            .stopping = &stopping,
+        }}) catch |err| block: {
+            logger.message(io, .warn, "page_cache_prewarm_start_failed", "error={t}", .{err});
+            break :block null;
+        };
+    }
+
     while (!shutdown.requested()) {
         std.Io.sleep(io, .{ .nanoseconds = 50 * std.time.ns_per_ms }, .awake) catch {};
     }
@@ -328,6 +344,7 @@ fn run(
     const forced_connections = connection_registry.activeCount();
     if (forced_connections != 0) connection_registry.shutdownAll();
     for (worker_threads) |thread| thread.join();
+    if (prewarm_thread) |thread| thread.join();
 
     const elapsed_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds - shutdown_start_ns, std.time.ns_per_ms);
     logger.message(io, .info, "shutdown_complete", "duration_ms={d} forced_connections={d}", .{ elapsed_ms, forced_connections });
@@ -407,7 +424,7 @@ fn logStartup(
         io,
         .info,
         "page_cache_config",
-        "enabled={s} capacity={d} shards={d} max_body_bytes={d} ttl_percent={d} response_header={s} fill_wait_timeout_ms={d}",
+        "enabled={s} capacity={d} shards={d} max_body_bytes={d} ttl_percent={d} response_header={s} fill_wait_timeout_ms={d} prewarm={s}",
         .{
             if (config.page_cache_enabled) "on" else "off",
             config.page_cache_capacity,
@@ -416,6 +433,7 @@ fn logStartup(
             config.page_cache_ttl_percent,
             if (config.page_cache_response_header) "on" else "off",
             config.page_cache_fill_wait_timeout_ms,
+            if (config.page_cache_enabled and config.page_cache_prewarm_enabled) "on" else "off",
         },
     );
     logger.message(
@@ -599,7 +617,10 @@ fn quicAcceptLoop(shared: *SharedServer, socket: *quic_transport.Socket) void {
             shared.keep_alive_requests,
             ssl_handle,
             shared.stopping,
-        ) catch {
+        ) catch |err| {
+            if (!shared.stopping.load(.acquire)) {
+                logger.message(shared.io, .warn, "http3_session_failed", "error={t}", .{err});
+            }
             std.Io.sleep(shared.io, .{ .nanoseconds = 10 * std.time.ns_per_ms }, .awake) catch {};
             continue;
         };

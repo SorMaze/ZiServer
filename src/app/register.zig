@@ -17,14 +17,14 @@ const registry = z.handlers(.{
     examples.streamEcho,
     examples.streamChunks,
     examples.streamDemo,
+    examples.cacheArena,
     site.handle,
 });
 
 const h = registry;
 
 const public_page_layers = z.layers(.{
-    z.layer.cache(.api_short),
-    z.layer.pageCache(.standard),
+    z.layer.cacheStrategy(.static_shared),
     z.layer.cors(.public_read),
     z.layer.rate(.relaxed),
 });
@@ -84,6 +84,14 @@ const routes = z.routes(.{
     public_pages,
     site_aliases,
     public_api,
+    h.get("/cache-arena/static-shared", examples.cacheArena)
+        .cacheStrategy(.static_shared),
+    h.get("/cache-arena/recommended", examples.cacheArena)
+        .cacheStrategy(.recommended),
+    h.get("/cache-arena/discouraged", examples.cacheArena)
+        .cacheStrategy(.discouraged),
+    h.get("/cache-arena/never", examples.cacheArena)
+        .cacheStrategy(.never),
     h.get("/admin/stats", system.stats)
         .withLayer(z.layer.auth(.bearer_or_api_key))
         .withLayer(z.layer.rate(.strict)),

@@ -168,3 +168,18 @@ pub fn streamDemo(ctx: *Context) !void {
     }
     try output.finish();
 }
+
+pub fn cacheArena(ctx: *Context) !void {
+    const prefix = "/cache-arena/";
+    const strategy = if (std.mem.startsWith(u8, ctx.request.path, prefix))
+        ctx.request.path[prefix.len..]
+    else
+        "unknown";
+    var body_buffer: [192]u8 = undefined;
+    const body = try std.fmt.bufPrint(
+        &body_buffer,
+        "{{\"arena\":\"page-cache\",\"strategy\":\"{s}\",\"path\":\"{s}\"}}\n",
+        .{ strategy, ctx.request.path },
+    );
+    try ctx.json(.ok, body);
+}

@@ -41,6 +41,7 @@ pub const env_page_cache_max_body = "ZISERVER_PAGE_CACHE_MAX_BODY";
 pub const env_page_cache_ttl_percent = "ZISERVER_PAGE_CACHE_TTL_PERCENT";
 pub const env_page_cache_header = "ZISERVER_PAGE_CACHE_HEADER";
 pub const env_page_cache_fill_wait_timeout = "ZISERVER_PAGE_CACHE_FILL_WAIT_TIMEOUT";
+pub const env_page_cache_prewarm = "ZISERVER_PAGE_CACHE_PREWARM";
 pub const env_xss_mode = "ZISERVER_XSS_MODE";
 pub const env_xss_scan_query = "ZISERVER_XSS_SCAN_QUERY";
 pub const env_xss_scan_body = "ZISERVER_XSS_SCAN_BODY";
@@ -103,6 +104,7 @@ pub const ServerConfig = struct {
     page_cache_ttl_percent: u16 = page_cache.default_ttl_percent,
     page_cache_response_header: bool = page_cache.default_response_header,
     page_cache_fill_wait_timeout_ms: u32 = page_cache.default_fill_wait_timeout_ms,
+    page_cache_prewarm_enabled: bool = true,
     static_mode: http_config.StaticMode = defaultStaticMode(),
     static_dir: []const u8 = http_config.default_static_dir,
     auth_token: ?[]const u8 = null,
@@ -126,6 +128,7 @@ pub const ServerConfig = struct {
     page_cache_ttl_explicit: bool = false,
     page_cache_header_explicit: bool = false,
     page_cache_fill_wait_timeout_explicit: bool = false,
+    page_cache_prewarm_explicit: bool = false,
     xss_mode_explicit: bool = false,
     xss_scan_query_explicit: bool = false,
     xss_scan_body_explicit: bool = false,
@@ -323,6 +326,11 @@ pub const ServerConfig = struct {
         if (!self.page_cache_fill_wait_timeout_explicit) {
             if (nonEmpty(environ.get(env_page_cache_fill_wait_timeout))) |value| {
                 self.page_cache_fill_wait_timeout_ms = std.fmt.parseInt(u32, value, 10) catch return error.InvalidPageCacheFillWaitTimeout;
+            }
+        }
+        if (!self.page_cache_prewarm_explicit) {
+            if (nonEmpty(environ.get(env_page_cache_prewarm))) |value| {
+                self.page_cache_prewarm_enabled = parseOnOff(value) catch return error.InvalidPageCachePrewarm;
             }
         }
 
@@ -608,6 +616,7 @@ pub fn parseArgs(
             error.InvalidPageCacheTtlPercent => std.debug.print("{s} must be an integer\n", .{env_page_cache_ttl_percent}),
             error.InvalidPageCacheHeader => std.debug.print("{s} must be on or off\n", .{env_page_cache_header}),
             error.InvalidPageCacheFillWaitTimeout => std.debug.print("{s} must be an integer from 0 to 30000\n", .{env_page_cache_fill_wait_timeout}),
+            error.InvalidPageCachePrewarm => std.debug.print("{s} must be on or off\n", .{env_page_cache_prewarm}),
             error.InvalidXssMode => std.debug.print("{s} must be off, observe, or block\n", .{env_xss_mode}),
             error.InvalidXssScanQuery => std.debug.print("{s} must be on or off\n", .{env_xss_scan_query}),
             error.InvalidXssScanBody => std.debug.print("{s} must be on or off\n", .{env_xss_scan_body}),
@@ -686,6 +695,8 @@ fn printUsage() void {
         \\  --page-cache-ttl-percent=N scale route TTLs, default 100, range 1..1000
         \\  --page-cache-header=on|off emit X-Page-Cache on hits, default off
         \\  --page-cache-fill-wait-timeout=MS max coalesced miss wait, default 100; 0 bypasses
+        \\  --page-cache-prewarm=on|off asynchronously render exact static-shared routes at startup, default on
+        \\  --no-page-cache-prewarm shorthand for --page-cache-prewarm=off
         \\  --xss-mode=off|observe|block server-wide minimum XSS policy, default off
         \\  --xss-scan-query=on|off inspect query strings when XSS policy is active, default on
         \\  --xss-scan-body=on|off inspect request bodies when XSS policy is active, default on
@@ -862,6 +873,12 @@ fn applyPageCacheArgument(config: *ServerConfig, arg: []const u8) !bool {
     } else if (std.mem.startsWith(u8, arg, "--page-cache-fill-wait-timeout=")) {
         config.page_cache_fill_wait_timeout_ms = try std.fmt.parseInt(u32, arg["--page-cache-fill-wait-timeout=".len..], 10);
         config.page_cache_fill_wait_timeout_explicit = true;
+    } else if (std.mem.startsWith(u8, arg, "--page-cache-prewarm=")) {
+        config.page_cache_prewarm_enabled = try parseOnOff(arg["--page-cache-prewarm=".len..]);
+        config.page_cache_prewarm_explicit = true;
+    } else if (std.mem.eql(u8, arg, "--no-page-cache-prewarm")) {
+        config.page_cache_prewarm_enabled = false;
+        config.page_cache_prewarm_explicit = true;
     } else {
         return false;
     }
@@ -1018,6 +1035,7 @@ test "page cache environment configures runtime store" {
     try env.put(env_page_cache_ttl_percent, "150");
     try env.put(env_page_cache_header, "on");
     try env.put(env_page_cache_fill_wait_timeout, "250");
+    try env.put(env_page_cache_prewarm, "off");
 
     var config = ServerConfig{};
     try config.applyRuntimeEnvironment(&env);
@@ -1029,6 +1047,7 @@ test "page cache environment configures runtime store" {
     try std.testing.expectEqual(@as(u16, 150), config.page_cache_ttl_percent);
     try std.testing.expect(config.page_cache_response_header);
     try std.testing.expectEqual(@as(u32, 250), config.page_cache_fill_wait_timeout_ms);
+    try std.testing.expect(!config.page_cache_prewarm_enabled);
 }
 
 test "explicit page cache config overrides environment" {
@@ -1067,6 +1086,7 @@ test "page cache CLI arguments set values and explicit precedence" {
     try std.testing.expect(try applyPageCacheArgument(&config, "--page-cache-ttl-percent=75"));
     try std.testing.expect(try applyPageCacheArgument(&config, "--page-cache-header=on"));
     try std.testing.expect(try applyPageCacheArgument(&config, "--page-cache-fill-wait-timeout=75"));
+    try std.testing.expect(try applyPageCacheArgument(&config, "--page-cache-prewarm=off"));
     try std.testing.expect(!(try applyPageCacheArgument(&config, "--unrelated=value")));
     try config.validatePageCache();
     try std.testing.expect(!config.page_cache_enabled);
@@ -1077,6 +1097,8 @@ test "page cache CLI arguments set values and explicit precedence" {
     try std.testing.expect(config.page_cache_ttl_explicit);
     try std.testing.expect(config.page_cache_response_header);
     try std.testing.expectEqual(@as(u32, 75), config.page_cache_fill_wait_timeout_ms);
+    try std.testing.expect(!config.page_cache_prewarm_enabled);
+    try std.testing.expect(config.page_cache_prewarm_explicit);
 }
 
 test "XSS environment and CLI configuration use explicit precedence" {

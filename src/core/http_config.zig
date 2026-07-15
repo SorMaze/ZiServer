@@ -157,6 +157,7 @@ pub const TlsConfig = struct {
 pub const CachePolicy = enum {
     none,
     no_cache,
+    no_store,
     static_asset,
     api_short,
 
@@ -164,6 +165,7 @@ pub const CachePolicy = enum {
         return switch (self) {
             .none => null,
             .no_cache => "no-cache",
+            .no_store => "no-store",
             .static_asset => "public, max-age=3600",
             .api_short => "public, max-age=30",
         };
@@ -173,6 +175,7 @@ pub const CachePolicy = enum {
         return switch (self) {
             .none => "none",
             .no_cache => "no-cache",
+            .no_store => "no-store",
             .static_asset => "static-asset",
             .api_short => "api-short",
         };

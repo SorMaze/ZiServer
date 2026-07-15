@@ -6,6 +6,7 @@ const http_config = @import("http_config.zig");
 const http2 = @import("http2.zig");
 const client_identity = @import("client_identity.zig");
 const errors = @import("errors.zig");
+const logger = @import("log.zig");
 const quic_transport = @import("quic_transport.zig");
 const response = @import("response.zig");
 
@@ -60,6 +61,7 @@ const Bridge = struct {
     userdata: ?*anyopaque,
     dispatch: DispatchFn,
     stopping: ?*const std.atomic.Value(bool),
+    last_now_ns: u64 = 0,
 };
 
 pub fn versionText() ?[:0]const u8 {
@@ -98,15 +100,23 @@ pub fn serve(
         max_requests,
         &summary,
     );
-    if (result != 0) {
-        return error.Http3SessionFailed;
-    }
+    if (result != 0) return switch (result) {
+        -2 => error.Http3ConnectionInitFailed,
+        -3 => error.Http3SocketReadFailed,
+        -4 => error.Http3TimerFailed,
+        -5 => error.Http3PacketReadFailed,
+        -6 => error.Http3PacketWriteFailed,
+        else => error.Http3SessionFailed,
+    };
     return summary;
 }
 
 fn readBridge(userdata: *anyopaque, buffer: [*]u8, len: usize, addr_out: ?*anyopaque, addrlen_out: *usize, timeout_ms: u32) callconv(.c) isize {
     const bridge: *Bridge = @ptrCast(@alignCast(userdata));
-    const datagram = (bridge.socket.recvFromTimeout(@max(timeout_ms, 1)) catch return -1) orelse return 0;
+    const datagram = (bridge.socket.recvFromTimeout(@max(timeout_ms, 1)) catch |err| {
+        logger.message(bridge.socket.io, .warn, "http3_socket_read_failed", "error={t}", .{err});
+        return -1;
+    }) orelse return 0;
     if (datagram.len > len) return -1;
     @memcpy(buffer[0..datagram.len], bridge.socket.recv_buf[0..datagram.len]);
     // Write back the source address in the platform sockaddr layout expected by ngtcp2.
@@ -142,6 +152,11 @@ fn dispatchBridge(
     const bridge: *Bridge = @ptrCast(@alignCast(userdata));
     const peer_ip = client_identity.IpKey.fromAddress(bridge.socket.last_peer);
     bridge.dispatch(bridge.userdata, request, captured_response, peer_ip) catch |err| {
+        logger.message(bridge.socket.io, .warn, "http3_dispatch_failed", "method={s} path={s} error={t}", .{
+            request.method(),
+            request.path(),
+            err,
+        });
         captured_response.deinit(capture_allocator);
         captured_response.* = .{};
         var target: response.Target = .{ .capture = .{
@@ -167,7 +182,19 @@ fn stopBridge(userdata: *anyopaque) callconv(.c) c_int {
 fn nowBridge(userdata: *anyopaque) callconv(.c) u64 {
     const bridge: *Bridge = @ptrCast(@alignCast(userdata));
     const value = std.Io.Clock.awake.now(bridge.socket.io).nanoseconds;
-    return @intCast(@max(value, 0));
+    return monotonicTimestamp(&bridge.last_now_ns, @intCast(@max(value, 0)));
+}
+
+fn monotonicTimestamp(last: *u64, candidate: u64) u64 {
+    last.* = @max(last.*, candidate);
+    return last.*;
+}
+
+test "HTTP3 clock bridge never moves backwards" {
+    var last: u64 = 100;
+    try std.testing.expectEqual(@as(u64, 100), monotonicTimestamp(&last, 99));
+    try std.testing.expectEqual(@as(u64, 100), monotonicTimestamp(&last, 100));
+    try std.testing.expectEqual(@as(u64, 101), monotonicTimestamp(&last, 101));
 }
 
 fn writeSockaddr(out_ptr: *anyopaque, addrlen_out: *usize, address: std.Io.net.IpAddress) !void {

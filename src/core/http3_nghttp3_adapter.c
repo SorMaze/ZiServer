@@ -573,7 +573,7 @@ static uint32_t next_read_timeout_ms(quic_session *s) {
 
 static int initialize_connection(quic_session *s, const uint8_t *packet, size_t packet_len,
                                  const struct sockaddr_storage *peer, size_t peer_len,
-                                 SSL_CTX *ssl_ctx) {
+                                 SSL_CTX *ssl_ctx, uint64_t initial_ts) {
     ngtcp2_pkt_hd header;
     if (ngtcp2_accept(&header, packet, packet_len) != 0 || header.type != NGTCP2_PKT_INITIAL) return 1;
     if (!ngtcp2_is_supported_version(header.version)) return 1;
@@ -610,7 +610,7 @@ static int initialize_connection(quic_session *s, const uint8_t *packet, size_t 
 
     ngtcp2_settings settings;
     ngtcp2_settings_default(&settings);
-    settings.initial_ts = s->now_fn(s->userdata);
+    settings.initial_ts = initial_ts;
     settings.handshake_timeout = 10 * NGTCP2_SECONDS;
     settings.max_tx_udp_payload_size = 1200;
 
@@ -709,15 +709,15 @@ int ziserver_nghttp3_serve(
         uint64_t now = s->now_fn(s->userdata);
         if (nread < 0) {
             if (s->stop_fn(s->userdata)) break;
-            result = -1;
+            result = -3;
             break;
         }
         if (nread == 0) {
             if (s->quic_conn && ngtcp2_conn_get_expiry2(s->quic_conn) <= now) {
                 int rv = ngtcp2_conn_handle_expiry(s->quic_conn, now);
                 if (rv == NGTCP2_ERR_IDLE_CLOSE || rv == NGTCP2_ERR_HANDSHAKE_TIMEOUT) break;
-                if (rv != 0) { result = -1; break; }
-                if (flush_packets(s) != 0) { result = -1; break; }
+                if (rv != 0) { result = -4; break; }
+                if (flush_packets(s) != 0) { result = -6; break; }
             }
             continue;
         }
@@ -725,20 +725,20 @@ int ziserver_nghttp3_serve(
             continue;
         if (!s->quic_conn) {
             int init = initialize_connection(s, packet, (size_t)nread, &peer, peer_len,
-                                             (SSL_CTX *)ssl_ctx_ptr);
+                                             (SSL_CTX *)ssl_ctx_ptr, now);
             if (init > 0) continue;
-            if (init < 0) { result = -1; break; }
+            if (init < 0) { result = -2; break; }
         }
         ngtcp2_pkt_info pi;
         memset(&pi, 0, sizeof(pi));
         int rv = ngtcp2_conn_read_pkt(s->quic_conn, &s->path.path, &pi,
                                       packet, (size_t)nread, now);
         if (rv == NGTCP2_ERR_DRAINING || rv == NGTCP2_ERR_DROP_CONN || rv == NGTCP2_ERR_RETRY) break;
-        if (rv != 0) { result = -1; break; }
+        if (rv != 0) { result = -5; break; }
         if (s->request_count >= s->max_requests && !s->summary.goaway_sent) {
             if (nghttp3_conn_submit_shutdown_notice(s->http3_conn) == 0) s->summary.goaway_sent = 1;
         }
-        if (flush_packets(s) != 0) { result = -1; break; }
+        if (flush_packets(s) != 0) { result = -6; break; }
     }
 
     if (summary) *summary = s->summary;

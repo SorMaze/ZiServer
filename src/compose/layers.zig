@@ -49,6 +49,11 @@ pub fn pageCache(value: page_cache.Policy) Layer {
     return .{ .name = "page_cache", .options = .{ .page_cache = value } };
 }
 
+/// Declares that a cached GET/HEAD response is independent of Cookie state.
+pub fn cacheStrategy(value: page_cache.Strategy) Layer {
+    return .{ .name = "cache_strategy", .options = .{ .cache_strategy = value } };
+}
+
 pub fn upload(value: http_config.UploadPolicy) Layer {
     return .{
         .name = "upload",

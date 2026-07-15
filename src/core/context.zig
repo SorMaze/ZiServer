@@ -341,7 +341,14 @@ pub const Context = struct {
             self.page_cache_fill = false;
             if (self.page_cache_store) |store| {
                 var key_buffer: [page_cache.max_key_bytes]u8 = undefined;
-                const key = page_cache.requestKey(self.request, &key_buffer) orelse return;
+                const key = page_cache.requestKeyForScope(
+                    self.request,
+                    if (self.route_options.cache_strategy) |strategy|
+                        strategy.profile().scope
+                    else
+                        .cookie_partitioned,
+                    &key_buffer,
+                ) orelse return;
                 store.put(
                     self.io,
                     key,
@@ -442,7 +449,7 @@ test "context fills page cache with a cache-transparent transport header" {
 
     var store = try page_cache_mod.Store.init(std.testing.allocator, .{});
     defer store.deinit(std.testing.io);
-    const request = try request_mod.Request.parse("GET /cached HTTP/1.1\r\nHost: test\r\n\r\n");
+    const request = try request_mod.Request.parse("GET /cached HTTP/1.1\r\nHost: test\r\nCookie: session=stable\r\n\r\n");
     var capture = response.Capture{};
     defer capture.deinit(std.testing.allocator);
     var target: response.Target = .{ .capture = .{ .response = &capture, .allocator = std.testing.allocator } };
@@ -462,7 +469,7 @@ test "context fills page cache with a cache-transparent transport header" {
         &store,
     );
     var key_buffer_for_fill: [page_cache_mod.max_key_bytes]u8 = undefined;
-    const fill_key = page_cache_mod.requestKey(request, &key_buffer_for_fill).?;
+    const fill_key = page_cache_mod.requestKeyForScope(request, .cookie_partitioned, &key_buffer_for_fill).?;
     const fill = try store.beginFill(std.testing.io, fill_key, std.Io.Clock.awake.now(std.testing.io).nanoseconds);
     ctx.enablePageCacheFill(.standard, fill.leader);
     try ctx.addTransportHeader("Alt-Svc", "h3=\":443\"");
@@ -472,7 +479,7 @@ test "context fills page cache with a cache-transparent transport header" {
     try std.testing.expectEqual(response.CachePolicy.no_cache, ctx.response_cache_policy);
 
     var key_buffer: [page_cache_mod.max_key_bytes]u8 = undefined;
-    const key = page_cache_mod.requestKey(request, &key_buffer).?;
+    const key = page_cache_mod.requestKeyForScope(request, .cookie_partitioned, &key_buffer).?;
     const hit = store.acquire(std.testing.io, key, std.Io.Clock.awake.now(std.testing.io).nanoseconds).?;
     defer hit.deinit();
     try std.testing.expectEqualStrings("body", hit.body());
