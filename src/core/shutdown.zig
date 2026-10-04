@@ -29,7 +29,7 @@ pub fn request() void {
     stop_requested.store(true, .release);
 }
 
-fn handlePosixSignal(_: c_int) callconv(.c) void {
+fn handlePosixSignal(_: std.posix.SIG) callconv(.c) void {
     request();
 }
 

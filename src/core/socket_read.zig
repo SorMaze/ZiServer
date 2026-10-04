@@ -36,7 +36,7 @@ pub fn read(
             error.Canceled => return error.Canceled,
             error.ConcurrencyUnavailable => return error.TimeoutUnavailable,
         };
-        return result.net_read;
+        return (try result.net_read).data_len;
     }
 }
 

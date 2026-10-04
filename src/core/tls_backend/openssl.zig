@@ -277,13 +277,13 @@ fn tlsIoWrite(
     if (len <= 0) return 0;
     const io = ioFromParts(userdata, vtable_ptr);
     const bytes = buffer[0..@intCast(len)];
-    const written = io.vtable.netWrite(
-        io.userdata,
-        handleFromValue(socket_handle),
-        &.{},
-        &.{bytes},
-        1,
-    ) catch return -1;
+    const result = io.operate(.{ .net_write = .{
+        .socket_handle = handleFromValue(socket_handle),
+        .header = &.{},
+        .data = &.{bytes},
+        .splat = 1,
+    } }) catch return -1;
+    const written = result.net_write catch return -1;
     return @intCast(written);
 }
 

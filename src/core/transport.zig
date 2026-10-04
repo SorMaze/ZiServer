@@ -180,7 +180,13 @@ pub const Connection = struct {
             };
         }
         const handle = self.stream.socket.handle;
-        return self.io.vtable.netWrite(self.io.userdata, handle, &.{}, &.{buffer}, 1) catch error.WriteFailed;
+        const result = self.io.operate(.{ .net_write = .{
+            .socket_handle = handle,
+            .header = &.{},
+            .data = &.{buffer},
+            .splat = 1,
+        } }) catch return error.WriteFailed;
+        return result.net_write catch error.WriteFailed;
     }
 
     pub fn writeAll(self: *Connection, buffer: []const u8) !void {

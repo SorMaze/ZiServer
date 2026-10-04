@@ -190,6 +190,7 @@ pub fn build(b: *std.Build) void {
         "LICENSES/nghttp2.txt",
         "LICENSES/ngtcp2.txt",
         "LICENSES/nghttp3.txt",
+        "LICENSES/sfparse.txt",
         "LICENSES/GSAP-3.12.5.txt",
     };
     for (legal_files) |file| b.installFile(file, file);
@@ -219,6 +220,12 @@ pub fn build(b: *std.Build) void {
 
     const bench_step = b.step("bench", "Run the HTTP benchmark client");
     bench_step.dependOn(&bench_cmd.step);
+
+    // Unit tests do not analyze every runtime path. Compile both entry points
+    // as well so changes to std.Io and provider callbacks cannot go unnoticed.
+    const check_step = b.step("check", "Compile the server and benchmark client");
+    check_step.dependOn(&server_exe.step);
+    check_step.dependOn(&bench_exe.step);
 
     const core_test_mod = b.createModule(.{
         .root_source_file = b.path("src/core_tests.zig"),
@@ -333,6 +340,7 @@ pub fn build(b: *std.Build) void {
     configureTlsRuntimeEnv(b, run_bench_tests, tls_provider, vcpkg_root, vcpkg_triplet);
 
     const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(check_step);
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_form_tests.step);
     test_step.dependOn(&run_xss_tests.step);
@@ -514,6 +522,15 @@ fn installHttp3RuntimeFiles(
     b.getInstallStep().dependOn(&b.addInstallBinFile(optionPath(b, ngtcp2_dll), "ngtcp2.dll").step);
     b.getInstallStep().dependOn(&b.addInstallBinFile(optionPath(b, ngtcp2_crypto_dll), "ngtcp2_crypto_ossl.dll").step);
     b.getInstallStep().dependOn(&b.addInstallBinFile(optionPath(b, nghttp3_dll), "nghttp3.dll").step);
+
+    // Recent vcpkg nghttp3 builds link sfparse dynamically. Older builds
+    // bundle it instead, so install this transitive dependency only if present.
+    const sfparse_dll = b.fmt("{s}/sfparse.dll", .{bin_dir});
+    std.Io.Dir.cwd().access(b.graph.io, sfparse_dll, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => std.debug.panic("cannot access {s}: {t}", .{ sfparse_dll, err }),
+    };
+    b.getInstallStep().dependOn(&b.addInstallBinFile(optionPath(b, sfparse_dll), "sfparse.dll").step);
 }
 
 fn installTlsRuntimeFiles(

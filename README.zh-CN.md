@@ -4,7 +4,9 @@
 
 完整的分类文档见[文档中心](docs/README.md)。
 
-使用 Zig master 版本 `0.17.0-dev.1282+c0f9b51d8` 构建的高并发 HTTP 服务器。
+面向 Zig 0.17 的高并发 HTTP 服务器，已使用 `0.17.0` 验证。
+
+socket 写入路径使用 Zig 0.17 的 `std.Io.operate(.net_write)` API，替代旧的 `Io.VTable.netWrite` 直接调用；POSIX 读取使用 `ReadResult.data_len`，信号回调参数使用 `std.posix.SIG`。`zig build check` 会编译服务器和压测客户端；`zig build test` 也包含此检查，因为单元测试不会分析所有运行时路径。master 持续变化，构建前请确认 `zig version`；本次移植的验证范围不包含 Zig 0.18 开发版。
 
 ## 平台支持与当前限制
 
@@ -175,7 +177,7 @@ zig build -Dtls=schannel
 | OpenSSL (libssl + libcrypto) | `openssl:x64-windows` | TLS 1.2/1.3 握手、加密、ALPN | 默认 |
 | nghttp2 | `nghttp2:x64-windows` | HTTP/2 帧、HPACK、stream 管理 | 默认 |
 | ngtcp2 | `ngtcp2[openssl]:x64-windows` | QUIC transport 层 | `-Dhttp3=nghttp3` |
-| ngtcp2_crypto_openssl | (随 ngtcp2 安装) | QUIC + OpenSSL TLS 桥接 | `-Dhttp3=nghttp3` |
+| ngtcp2_crypto_ossl | (随 ngtcp2 安装) | QUIC + OpenSSL TLS 桥接 | `-Dhttp3=nghttp3` |
 | nghttp3 | `nghttp3:x64-windows` | HTTP/3 帧（QPACK、stream 映射） | `-Dhttp3=nghttp3` |
 
 所有三方库通过 C adapter 桥接到 Zig 侧，C 文件只向 Zig 暴露稳定的 extern 函数。除 Zig 标准库外无纯 Zig 第三方依赖。
@@ -205,7 +207,7 @@ vcpkg 根目录按以下优先级解析：`-Dvcpkg-root`、`VCPKG_ROOT`、`VCPKG
 
 - include: `<vcpkg-root>/installed/<triplet>/include`
 - lib: `<vcpkg-root>/installed/<triplet>/lib`
-- runtime DLL: `libssl-3-x64.dll`、`libcrypto-3-x64.dll`，启用 HTTP/2 时的 `nghttp2.dll`，以及启用 HTTP/3 时的 `ngtcp2.dll`、`ngtcp2_crypto_openssl.dll`、`nghttp3.dll` 会随 `ziserver.exe` 安装到 `zig-out/bin`
+- runtime DLL: `libssl-3-x64.dll`、`libcrypto-3-x64.dll`，启用 HTTP/2 时的 `nghttp2.dll`，以及启用 HTTP/3 时的 `ngtcp2.dll`、`ngtcp2_crypto_ossl.dll`、`nghttp3.dll` 会随 `ziserver.exe` 安装到 `zig-out/bin`；新版 nghttp3 的传递依赖 `sfparse.dll` 在 triplet 中存在时也会安装。
 
 Windows + vcpkg 默认链接 `libssl/libcrypto/nghttp2`，其他平台默认链接 `ssl/crypto/nghttp2`。仍可通过 `-Dopenssl-ssl-lib`、`-Dopenssl-crypto-lib` 和 `-Dnghttp2-lib` 覆盖。如果 vcpkg 下载 CMake 或源码失败，先修复代理/网络后重新安装；ZiServer 不把 OpenSSL 源码 vendoring 进仓库。
 

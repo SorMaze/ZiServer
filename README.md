@@ -2,7 +2,9 @@
 
 English | [简体中文](README.zh-CN.md)
 
-A high-concurrency HTTP server built with Zig master version `0.17.0-dev.1282+c0f9b51d8`. ZiServer provides plaintext HTTP/1.0/1.1, TLS 1.2/1.3, HTTP/2 over ALPN, an experimental native HTTP/3 path, bounded streaming, middleware/route DSLs, dynamic page caching, trusted client identity, and graceful shutdown.
+A high-concurrency HTTP server targeting Zig 0.17, verified with `0.17.0`. ZiServer provides plaintext HTTP/1.0/1.1, TLS 1.2/1.3, HTTP/2 over ALPN, an experimental native HTTP/3 path, bounded streaming, middleware/route DSLs, dynamic page caching, trusted client identity, and graceful shutdown.
+
+The socket write paths use the Zig 0.17 `std.Io.operate(.net_write)` API, replacing direct calls to the former `Io.VTable.netWrite`. POSIX reads use `ReadResult.data_len`, and signal callbacks use `std.posix.SIG`. Use `zig build check` to compile both the server and benchmark client; `zig build test` also performs this check, since unit tests alone do not analyze every runtime path. Zig master is a moving target: confirm `zig version` before building. Zig 0.18 development builds are outside this migration's validation scope.
 
 Detailed documentation is available in the [documentation center](docs/README.en.md).
 
@@ -206,10 +208,10 @@ zig build -Dtls=schannel
 | OpenSSL | `openssl:x64-windows` | TLS 1.2/1.3, crypto, ALPN | Default |
 | nghttp2 | `nghttp2:x64-windows` | HTTP/2 frames, HPACK, streams | Default |
 | ngtcp2 | `ngtcp2[openssl]:x64-windows` | QUIC transport | `-Dhttp3=nghttp3` |
-| ngtcp2_crypto_openssl | installed with ngtcp2 | QUIC/OpenSSL bridge | `-Dhttp3=nghttp3` |
+| ngtcp2_crypto_ossl | installed with ngtcp2 | QUIC/OpenSSL bridge | `-Dhttp3=nghttp3` |
 | nghttp3 | `nghttp3:x64-windows` | HTTP/3 frames, QPACK, streams | `-Dhttp3=nghttp3` |
 
-C adapters expose stable extern functions to Zig. There are no pure-Zig third-party dependencies beyond the standard library. vcpkg roots are resolved in this order: `-Dvcpkg-root`, `VCPKG_ROOT`, `VCPKG_INSTALLATION_ROOT`, `VCPKG_HOME`, `Vcpkg_home`. Runtime DLLs are installed next to `ziserver.exe`.
+C adapters expose stable extern functions to Zig. There are no pure-Zig third-party dependencies beyond the standard library. vcpkg roots are resolved in this order: `-Dvcpkg-root`, `VCPKG_ROOT`, `VCPKG_INSTALLATION_ROOT`, `VCPKG_HOME`, `Vcpkg_home`. Runtime DLLs are installed next to `ziserver.exe`. For recent nghttp3 packages, the transitive `sfparse.dll` dependency is also installed when present in the vcpkg triplet.
 
 Certificates and keys are loaded at process startup and never compiled into the executable. Runtime precedence is CLI > environment > absent. Replacement currently requires restart; hot reload is not implemented.
 

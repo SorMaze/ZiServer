@@ -15,9 +15,10 @@ from [`LICENSES/`](LICENSES/).
 | nghttp2 | HTTP/2 framing, HPACK, and stream management | MIT | [`LICENSES/nghttp2.txt`](LICENSES/nghttp2.txt) |
 | ngtcp2 | Optional QUIC transport for native HTTP/3 | MIT | [`LICENSES/ngtcp2.txt`](LICENSES/ngtcp2.txt) |
 | nghttp3 | Optional HTTP/3 framing and QPACK | MIT | [`LICENSES/nghttp3.txt`](LICENSES/nghttp3.txt) |
+| sfparse | Transitive structured-field parser dependency of recent nghttp3 builds | MIT | [`LICENSES/sfparse.txt`](LICENSES/sfparse.txt) |
 | GSAP 3.12.5 and ScrollTrigger 3.12.5 | Demo-site animation assets under `src/public/assets/` | GreenSock Standard License | [`LICENSES/GSAP-3.12.5.txt`](LICENSES/GSAP-3.12.5.txt) |
 
-OpenSSL, nghttp2, ngtcp2, and nghttp3 are linked as external libraries and are
+OpenSSL, nghttp2, ngtcp2, nghttp3, and sfparse are linked as external libraries and are
 not copied into ZiServer's source tree. Windows builds may install their runtime
 DLLs beside `ziserver.exe`; those DLLs remain covered by their upstream terms.
 
