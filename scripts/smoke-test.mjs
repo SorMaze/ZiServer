@@ -167,7 +167,8 @@ async function runSoak(port, duration) {
     '--connections=2',
     '--streams=4',
     `--duration=${duration}`,
-  ], { encoding: 'utf8', timeout: (duration + 30) * 1000 });
+    '--grace=30',
+  ], { encoding: 'utf8', timeout: (duration + 45) * 1000 });
   process.stdout.write(result.stdout);
   process.stderr.write(result.stderr);
   assert.equal(result.status, 0, 'HTTP/2 soak failed');

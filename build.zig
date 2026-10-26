@@ -420,8 +420,8 @@ fn applyTlsProvider(
             .flags = &.{ "-Wall", "-Wextra", "-Wpedantic" },
         });
         module.linkSystemLibrary("c", .{});
-        module.linkSystemLibrary(openssl_ssl_lib, .{});
-        module.linkSystemLibrary(openssl_crypto_lib, .{});
+        module.linkSystemLibrary(openssl_ssl_lib, .{ .use_pkg_config = .no });
+        module.linkSystemLibrary(openssl_crypto_lib, .{ .use_pkg_config = .no });
     }
 }
 
@@ -462,7 +462,7 @@ fn applyHttp2Provider(
         .flags = &.{ "-Wall", "-Wextra", "-Wpedantic" },
     });
     module.linkSystemLibrary("c", .{});
-    module.linkSystemLibrary(nghttp2_lib, .{});
+    module.linkSystemLibrary(nghttp2_lib, .{ .use_pkg_config = .no });
 }
 
 fn installHttp2RuntimeFiles(
@@ -502,9 +502,9 @@ fn applyHttp3Provider(
         .flags = &.{ "-Wall", "-Wextra", "-Wpedantic" },
     });
     module.linkSystemLibrary("c", .{});
-    module.linkSystemLibrary("ngtcp2", .{});
-    module.linkSystemLibrary("ngtcp2_crypto_ossl", .{});
-    module.linkSystemLibrary("nghttp3", .{});
+    module.linkSystemLibrary("ngtcp2", .{ .use_pkg_config = .no });
+    module.linkSystemLibrary("ngtcp2_crypto_ossl", .{ .use_pkg_config = .no });
+    module.linkSystemLibrary("nghttp3", .{ .use_pkg_config = .no });
 }
 
 fn installHttp3RuntimeFiles(
