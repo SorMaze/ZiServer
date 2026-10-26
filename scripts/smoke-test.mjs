@@ -108,7 +108,7 @@ async function streamingRequest(port, tls, useHttp2) {
     };
     const onData = (chunk) => {
       chunks.push(chunk);
-      if (!continued && !useHttp2) {
+      if (!continued) {
         continued = true;
         request.end('bravo\n');
       }
@@ -147,12 +147,6 @@ async function streamingRequest(port, tls, useHttp2) {
     if (useHttp2) {
       request.on('data', onData);
       request.on('end', onEnd);
-      setTimeout(() => {
-        if (!continued && !request.destroyed && !request.writableEnded) {
-          continued = true;
-          request.end('bravo\n');
-        }
-      }, 300);
     }
     request.write('alpha\n');
   });

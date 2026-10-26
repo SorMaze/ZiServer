@@ -128,6 +128,7 @@ const Bridge = struct {
     stopping: ?*const std.atomic.Value(bool),
     deadline_initialized: bool = false,
     active_phase: bool = false,
+    read_deadline_ns: i96 = 0,
     ready_mutex: std.Io.Mutex = .init,
     ready_tasks: [ready_task_capacity]?*DispatchTask = emptyReadyTasks(),
     ready_head: usize = 0,
@@ -203,15 +204,23 @@ pub fn serve(
     return summary;
 }
 
-fn readBridge(userdata: *anyopaque, buffer: [*]u8, len: usize, active_streams: c_int, pending_dispatches: c_int) callconv(.c) isize {
-    const bridge: *Bridge = @ptrCast(@alignCast(userdata));
-    const active_phase = active_streams != 0;
-    _ = pending_dispatches;
+fn updateReadPhase(bridge: *Bridge, active_phase: bool) void {
     if (!bridge.deadline_initialized or bridge.active_phase != active_phase) {
-        bridge.connection.setReadTimeoutMs(if (active_phase) bridge.stream_timeout_ms else bridge.idle_timeout_ms);
+        const timeout_ms = if (active_phase) bridge.stream_timeout_ms else bridge.idle_timeout_ms;
+        bridge.read_deadline_ns = if (timeout_ms == 0)
+            0
+        else
+            std.Io.Clock.awake.now(bridge.connection.io).nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
+        bridge.connection.setReadTimeoutMs(timeout_ms);
         bridge.deadline_initialized = true;
         bridge.active_phase = active_phase;
     }
+}
+
+fn readBridge(userdata: *anyopaque, buffer: [*]u8, len: usize, active_streams: c_int, pending_dispatches: c_int) callconv(.c) isize {
+    const bridge: *Bridge = @ptrCast(@alignCast(userdata));
+    _ = pending_dispatches;
+    updateReadPhase(bridge, active_streams != 0);
     var buffers: [1][]u8 = .{buffer[0..len]};
     const read = bridge.connection.read(&buffers) catch |err| switch (err) {
         error.ReadTimeout => return -2,
@@ -223,6 +232,12 @@ fn readBridge(userdata: *anyopaque, buffer: [*]u8, len: usize, active_streams: c
 
 fn readReadyBridge(userdata: *anyopaque, timeout_ms: u32) callconv(.c) c_int {
     const bridge: *Bridge = @ptrCast(@alignCast(userdata));
+    // Readiness polling must honor the same deadline and shutdown signals as
+    // readBridge, even when no further request DATA arrives to trigger a read.
+    updateReadPhase(bridge, true);
+    if (shutdownBridge(userdata) != 0) return -3;
+    if (bridge.read_deadline_ns != 0 and
+        std.Io.Clock.awake.now(bridge.connection.io).nanoseconds >= bridge.read_deadline_ns) return -2;
     return @intFromBool(bridge.connection.waitReadable(timeout_ms) catch return -1);
 }
 

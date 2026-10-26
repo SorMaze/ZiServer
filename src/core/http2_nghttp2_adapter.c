@@ -613,11 +613,9 @@ static int ziserver_h2_on_frame_recv(
     return 0;
 }
 
-/// A handler with a request body cannot make progress until the peer's next
-/// DATA frame arrives. Do not route that case through the short response-poll
-/// timeout: on Windows a nominal 1 ms event wait is commonly rounded to the
-/// scheduler quantum, turning a normal HEADERS -> DATA sequence into a large
-/// per-request delay and starving concurrent POST streams.
+/// Prefer immediately available DATA over response-poll spins for open bodies.
+/// A duplex handler can also publish a response before the next DATA arrives,
+/// so an open body must not cause an unbounded socket read while dispatching.
 static int ziserver_h2_has_open_request_body(const ziserver_h2_session *context) {
     for (const ziserver_h2_stream *stream = context->streams; stream != NULL; stream = stream->next) {
         if (stream->dispatch_task != NULL && !stream->request_ended) return 1;
@@ -847,7 +845,13 @@ int ziserver_nghttp2_serve(
             break;
         }
 
-        if (context.pending_dispatches != 0 && !ziserver_h2_has_open_request_body(&context)) {
+        int read_ready = 1;
+        if (context.pending_dispatches != 0) {
+            read_ready = ziserver_h2_has_open_request_body(&context)
+                ? context.read_ready(context.userdata, 0)
+                : 0;
+        }
+        if (read_ready == 0) {
             if (response_poll_spins < ZISERVER_H2_RESPONSE_POLL_SPINS) {
                 response_poll_spins += 1;
                 if (context.yield(context.userdata) != 0) {
@@ -863,15 +867,13 @@ int ziserver_nghttp2_serve(
             // Dispatch tasks can finish while the socket is idle. Keep this
             // bounded wait as a slow-handler fallback, but let immediate
             // ready-queue responses avoid the platform timer quantum above.
-            int ready = context.read_ready(context.userdata, 1);
-            if (ready == 0) continue;
-            if (ready < 0) {
-                result = NGHTTP2_ERR_CALLBACK_FAILURE;
-                break;
-            }
+            read_ready = context.read_ready(context.userdata, 1);
+            if (read_ready == 0) continue;
         }
         response_poll_spins = 0;
-        intptr_t read_result = context.read(
+        // Negative readiness results use the read callback's timeout/shutdown
+        // codes so polling cannot bypass stream deadlines or graceful GOAWAY.
+        intptr_t read_result = read_ready < 0 ? read_ready : context.read(
             context.userdata,
             input,
             sizeof(input),
