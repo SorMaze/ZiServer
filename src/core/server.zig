@@ -17,6 +17,7 @@ const static = @import("static.zig");
 const stats_mod = @import("stats.zig");
 const stream_queue = @import("stream_queue.zig");
 const tls = @import("tls.zig");
+const tls_control = @import("tls_control.zig");
 const transport = @import("transport.zig");
 
 const worker_thread_stack_size = 2 * 1024 * 1024;
@@ -36,7 +37,7 @@ const SharedServer = struct {
     stats: *stats_mod.Stats,
     static_store: *const static.Store,
     application: *const http.Application,
-    tls_context: ?*const tls.ServerContext,
+    tls_context: ?*tls.ServerContext,
     keep_alive_requests: usize,
     http2: http_config.Http2Mode,
     http3: http_config.Http3Mode,
@@ -126,19 +127,22 @@ fn run(
     const redirect_host_policy = try config.redirectHostPolicy();
 
     var tls_context: ?tls.ServerContext = if (config.tls.mode == .terminate)
-        tls.initServerContext(allocator, .{
-            .provider = config.tlsProvider(),
-            .tls = config.tls,
-            .advertise_h2 = config.http2 == .on,
-        }) catch |err| {
-            logger.message(io, .err, "tls_provider_init_failed", "provider={s} error={t}", .{ config.tlsProvider().text(), err });
-            if (config.tlsProvider() == .openssl) {
-                if (tls.opensslLastErrorText()) |text| {
-                    if (text.len != 0) logger.message(io, .err, "openssl_error", "detail={s}", .{text});
+        if (config.tls_control_file != null)
+            tls.ServerContext{ .provider = config.tlsProvider() }
+        else
+            tls.initServerContext(allocator, .{
+                .provider = config.tlsProvider(),
+                .tls = config.tls,
+                .advertise_h2 = config.http2 == .on,
+            }) catch |err| {
+                logger.message(io, .err, "tls_provider_init_failed", "provider={s} error={t}", .{ config.tlsProvider().text(), err });
+                if (config.tlsProvider() == .openssl) {
+                    if (tls.opensslLastErrorText()) |text| {
+                        if (text.len != 0) logger.message(io, .err, "openssl_error", "detail={s}", .{text});
+                    }
                 }
+                return 1;
             }
-            return 1;
-        }
     else
         null;
     defer if (tls_context) |*context| context.deinit();
@@ -193,6 +197,20 @@ fn run(
     const connection_slots = try allocator.alloc(?*transport.Connection, workers);
     defer allocator.free(connection_slots);
     var connection_registry = transport.ConnectionRegistry.init(io, connection_slots);
+    var certificate_control: ?tls_control.Controller = if (config.tls_control_file) |path|
+        tls_control.Controller.init(path, .{
+            .provider = config.tlsProvider(),
+            .tls = config.tls,
+            .advertise_h2 = config.http2 == .on,
+        }, config.tls_control_interval_ms)
+    else
+        null;
+    if (certificate_control) |*control| {
+        control.apply(io, allocator, &tls_context.?, &connection_registry) catch |err| {
+            logger.message(io, .err, "tls_control_init_failed", "error={t}", .{err});
+            return 1;
+        };
+    }
     var stopping: std.atomic.Value(bool) = .init(false);
 
     logStartup(
@@ -302,6 +320,7 @@ fn run(
     }
 
     while (!shutdown.requested()) {
+        if (certificate_control) |*control| control.tick(io, allocator, &tls_context.?, &connection_registry);
         std.Io.sleep(io, .{ .nanoseconds = 50 * std.time.ns_per_ms }, .awake) catch {};
     }
 

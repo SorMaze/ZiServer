@@ -16,6 +16,8 @@ Linux has not yet received equivalent long-running, memory-stability, or release
 
 ## CI and runtime regressions
 
+OpenSSL HTTPS now supports [certificate replacement/revocation and client CRL/OCSP policy updates without restart](docs/en/operations/tls-certificate-lifecycle.md) through a local `--tls-control=FILE` document.
+
 `.github/workflows/ci.yml` pins Zig 0.17.0 on Ubuntu and Windows, covers Debug/ReleaseFast, OpenSSL+nghttp2/`-Dtls=none`, and filesystem/embedded static modes, and runs builds, unit tests, and runtime smoke checks.
 
 ```bash

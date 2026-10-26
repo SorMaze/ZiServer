@@ -110,6 +110,8 @@ pub const ServerConfig = struct {
     auth_token: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     tls: http_config.TlsConfig = .{},
+    tls_control_file: ?[]const u8 = null,
+    tls_control_interval_ms: u32 = 1000,
     http2: http_config.Http2Mode = .reject,
     http3: http_config.Http3Mode = .off,
     http3_port: u16 = default_http3_port,
@@ -175,7 +177,15 @@ pub const ServerConfig = struct {
     }
 
     pub fn validateProtocolSupport(self: ServerConfig) !void {
-        try tls.validate(.{ .provider = self.tlsProvider(), .tls = self.tls });
+        if (self.tls_control_file == null) try tls.validate(.{ .provider = self.tlsProvider(), .tls = self.tls });
+        if (self.tls_control_file) |path| {
+            if (path.len == 0 or self.tls.mode != .terminate or self.tlsProvider() != .openssl or
+                self.http3 != .off or self.tls_control_interval_ms < 50 or self.tls_control_interval_ms > 60_000)
+            {
+                std.debug.print("--tls-control requires OpenSSL termination, HTTP/3 off, and interval 50..60000 ms\n", .{});
+                return error.InvalidProtocolConfig;
+            }
+        }
         if (self.tls.mode == .terminate and self.port == self.https_port) {
             std.debug.print("--port and --https-port must use different ports when TLS is enabled\n", .{});
             return error.InvalidProtocolConfig;
@@ -264,7 +274,7 @@ pub const ServerConfig = struct {
         if (!self.tls_mode_explicit) {
             if (nonEmpty(environ.get(env_tls_mode))) |value| {
                 self.tls.mode = try parseTlsMode(value);
-            } else if (self.tls.cert_file != null or self.tls.key_file != null) {
+            } else if (self.tls.cert_file != null or self.tls.key_file != null or self.tls_control_file != null) {
                 self.tls.mode = .terminate;
             }
         }
@@ -560,6 +570,10 @@ pub fn parseArgs(
             config.tls.cert_file = arg["--tls-cert=".len..];
         } else if (std.mem.startsWith(u8, arg, "--tls-key=")) {
             config.tls.key_file = arg["--tls-key=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--tls-control=")) {
+            config.tls_control_file = arg["--tls-control=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--tls-control-interval=")) {
+            config.tls_control_interval_ms = try std.fmt.parseInt(u32, arg["--tls-control-interval=".len..], 10);
         } else if (std.mem.startsWith(u8, arg, "--tls-min=")) {
             config.tls.min_version = parseTlsMinVersion(arg["--tls-min=".len..]) catch {
                 std.debug.print("--tls-min must be 1.2 or 1.3\n\n", .{});
@@ -717,6 +731,8 @@ fn printUsage() void {
         \\  --tls=off|terminate TLS mode; certificate configuration enables terminate by default
         \\  --tls-cert=FILE certificate chain; overrides ZISERVER_TLS_CERT
         \\  --tls-key=FILE private key; overrides ZISERVER_TLS_KEY
+        \\  --tls-control=FILE local JSON state for certificate replacement/revocation (OpenSSL HTTPS only)
+        \\  --tls-control-interval=MS poll interval, default 1000, range 50..60000
         \\  --tls-min=1.2|1.3 minimum TLS version; defaults to 1.2 with TLS 1.3 preferred
         \\  --http2=off|reject|on HTTP/2 handling; defaults to on when TLS certificates are configured
         \\  --http3=off|advertise advertise an external HTTP/3 endpoint via Alt-Svc on HTTPS responses

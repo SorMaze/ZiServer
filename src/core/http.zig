@@ -85,7 +85,7 @@ pub const ProtocolRedirectPorts = struct {
 pub const ServeOptions = struct {
     keep_alive_requests: usize = 0,
     http2: http_config.Http2Mode = .reject,
-    tls_context: ?*const tls.ServerContext = null,
+    tls_context: ?*tls.ServerContext = null,
     http3: http_config.Http3Mode = .off,
     http3_port: u16 = 443,
     listener_tls: bool = false,
@@ -217,6 +217,14 @@ fn handleConnection(
         destination.scheme == .https
     else
         serve_opts.listener_tls;
+    if (!is_tls) {
+        if (serve_opts.tls_context) |context| {
+            if (context.requiresClientAuth(io)) {
+                try rejectPlainClientAuth(&connection, serve_opts.header_timeout_ms);
+                return;
+            }
+        }
+    }
     if (is_tls) {
         connection.setReadTimeoutMs(serve_opts.tls_handshake_timeout_ms);
         const tls_context = serve_opts.tls_context orelse return error.TlsContextUnavailable;
@@ -423,6 +431,24 @@ fn handleConnection(
             .close => return,
         }
     }
+}
+
+fn rejectPlainClientAuth(connection: *transport.Connection, timeout_ms: u32) !void {
+    // Consume the bounded request headers before closing. Closing immediately
+    // after the protocol PEEK can reset the socket before a 403 is delivered.
+    connection.setReadTimeoutMs(timeout_ms);
+    var buffer: [http_config.max_header_bytes]u8 = undefined;
+    var filled: usize = 0;
+    var reads: usize = 0;
+    while (std.mem.indexOf(u8, buffer[0..filled], "\r\n\r\n") == null) {
+        if (filled == buffer.len or reads == http_config.max_header_read_ops) return;
+        var buffers: [1][]u8 = .{buffer[filled..]};
+        const count = try connection.read(&buffers);
+        if (count == 0) return;
+        filled += count;
+        reads += 1;
+    }
+    try connection.writeAll("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
 }
 
 fn dispatchHttp2Request(

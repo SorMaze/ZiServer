@@ -16,6 +16,8 @@ Linux 尚未完成与 Windows 同等级的长稳态、内存稳定性或发布�
 
 ## CI 与运行时回归
 
+OpenSSL HTTPS 支持通过本地 `--tls-control=FILE` 控制文件[无重启替换/停用证书，并热更新客户端 CRL/OCSP 策略](docs/zh-CN/operations/tls-certificate-lifecycle.md)。
+
 `.github/workflows/ci.yml` 在 Ubuntu 和 Windows 上固定 Zig 0.17.0，覆盖 Debug/ReleaseFast、OpenSSL+nghttp2/`-Dtls=none` 和 filesystem/embedded static，并执行构建、单元测试及运行时 smoke。
 
 ```bash

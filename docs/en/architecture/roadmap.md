@@ -33,7 +33,7 @@ This list is based on the current source, build options, tests, and public docum
 ## P2: Production operations and quality gates
 
 9. **Observability**: Prometheus/OpenTelemetry export, latency histograms by protocol/status/route, and an asynchronous structured-log sink.
-10. **TLS lifecycle**: finish the SChannel provider, support certificate hot reload/rotation, and cover handshake failure, ALPN, and close paths.
+10. **TLS lifecycle (OpenSSL HTTPS hot updates complete)**: server rotation/emergency disable, certificate/SPKI blocklists, and mTLS CRL/signed-OCSP policy updates are implemented. SChannel, experimental HTTP/3 lifecycle support, and renewal automation remain. See [certificate lifecycle operations](../operations/tls-certificate-lifecycle.md).
 11. **Configuration reload**: use atomic snapshots for safely reloadable timeout, rate-limit, logging, and cache policies; listener addresses and the thread model continue to require restart.
 12. **Automated quality gates (foundation complete)**: GitHub Actions covers Ubuntu/Windows, Debug/ReleaseFast, TLS/HTTP2 switches, filesystem/embedded static modes, unit tests, protocol/streaming smoke checks, short HTTP/2 soak tests, and POSIX SIGTERM regressions. Parser fuzzing, long-running and memory-curve checks, sanitizer/leak checks, and macOS validation remain.
 

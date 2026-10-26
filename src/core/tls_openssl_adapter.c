@@ -4,6 +4,8 @@
 #include <openssl/err.h>
 #include <openssl/bio.h>
 #include <openssl/crypto.h>
+#include <openssl/ocsp.h>
+#include <openssl/pem.h>
 
 #if defined(_MSC_VER)
 #define ZISERVER_THREAD_LOCAL __declspec(thread)
@@ -305,6 +307,13 @@ SSL_CTX *ziserver_openssl_server_ctx_new(
         return NULL;
     }
 
+    X509 *certificate = SSL_CTX_get0_certificate(ctx);
+    if (certificate == NULL || X509_cmp_current_time(X509_get0_notBefore(certificate)) >= 0 ||
+        X509_cmp_current_time(X509_get0_notAfter(certificate)) <= 0) {
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+
     ziserver_openssl_reset_error();
     return ctx;
 }
@@ -313,6 +322,234 @@ void ziserver_openssl_server_ctx_free(SSL_CTX *ctx) {
     if (ctx != NULL) {
         SSL_CTX_free(ctx);
     }
+}
+
+int ziserver_openssl_server_ctx_retain(SSL_CTX *ctx) {
+    return SSL_CTX_up_ref(ctx);
+}
+
+static int ziserver_openssl_certificate_denied(
+    X509 *certificate,
+    const uint8_t *cert_hashes, size_t cert_count,
+    const uint8_t *spki_hashes, size_t spki_count
+) {
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int length = 0;
+    if (certificate == NULL) return -1;
+    if (cert_count != 0) {
+        if (X509_digest(certificate, EVP_sha256(), digest, &length) != 1 || length != 32) return -1;
+        for (size_t i = 0; i < cert_count; ++i) {
+            if (CRYPTO_memcmp(digest, cert_hashes + i * 32, 32) == 0) return 1;
+        }
+    }
+    if (spki_count != 0) {
+        // Hash the complete DER SubjectPublicKeyInfo, including its algorithm
+        // identifier. X509_pubkey_digest hashes only the public-key BIT STRING.
+        unsigned char *encoded = NULL;
+        int size = i2d_X509_PUBKEY(X509_get_X509_PUBKEY(certificate), &encoded);
+        if (size <= 0) return -1;
+        int result = EVP_Digest(encoded, (size_t)size, digest, &length, EVP_sha256(), NULL);
+        OPENSSL_free(encoded);
+        if (result != 1 || length != 32) return -1;
+        for (size_t i = 0; i < spki_count; ++i) {
+            if (CRYPTO_memcmp(digest, spki_hashes + i * 32, 32) == 0) return 1;
+        }
+    }
+    return 0;
+}
+
+int ziserver_openssl_server_ctx_denied(
+    SSL_CTX *ctx,
+    const uint8_t *cert_hashes, size_t cert_count,
+    const uint8_t *spki_hashes, size_t spki_count
+) {
+    int result = ziserver_openssl_certificate_denied(
+        SSL_CTX_get0_certificate(ctx), cert_hashes, cert_count, spki_hashes, spki_count);
+    if (result != 0) return result;
+    STACK_OF(X509) *chain = NULL;
+    if (SSL_CTX_get0_chain_certs(ctx, &chain) != 1) return -1;
+    for (int i = 0; chain != NULL && i < sk_X509_num(chain); ++i) {
+        result = ziserver_openssl_certificate_denied(
+            sk_X509_value(chain, i), cert_hashes, cert_count, spki_hashes, spki_count);
+        if (result != 0) return result;
+    }
+    return 0;
+}
+
+typedef struct {
+    uint8_t cert_hashes[64][32];
+    size_t cert_count;
+    uint8_t spki_hashes[64][32];
+    size_t spki_count;
+    OCSP_BASICRESP **responses;
+    size_t response_count;
+} ziserver_client_policy;
+
+static CRYPTO_ONCE ziserver_client_policy_once = CRYPTO_ONCE_STATIC_INIT;
+static int ziserver_client_policy_index = -1;
+
+static void ziserver_client_policy_free(
+    void *parent, void *pointer, CRYPTO_EX_DATA *data, int index, long argument, void *argument_pointer
+) {
+    (void)parent; (void)data; (void)index; (void)argument; (void)argument_pointer;
+    ziserver_client_policy *policy = pointer;
+    if (policy == NULL) return;
+    for (size_t i = 0; i < policy->response_count; ++i) OCSP_BASICRESP_free(policy->responses[i]);
+    OPENSSL_free(policy->responses);
+    OPENSSL_free(policy);
+}
+
+static void ziserver_client_policy_index_init(void) {
+    ziserver_client_policy_index = SSL_CTX_get_ex_new_index(0, NULL, NULL, NULL, ziserver_client_policy_free);
+}
+
+static int ziserver_ocsp_current(OCSP_SINGLERESP *single) {
+    ASN1_GENERALIZEDTIME *revocation = NULL, *this_update = NULL, *next_update = NULL;
+    int reason = 0;
+    (void)OCSP_single_get0_status(single, &reason, &revocation, &this_update, &next_update);
+    // Bound response age even if its issuer gives it a very distant expiry.
+    return this_update != NULL && next_update != NULL &&
+        OCSP_check_validity(this_update, next_update, 300, 86400) == 1;
+}
+
+static int ziserver_client_verify(int preverified, X509_STORE_CTX *verification) {
+    if (!preverified) return 0;
+    if (X509_STORE_CTX_get_error_depth(verification) != 0) return 1;
+    SSL *ssl = X509_STORE_CTX_get_ex_data(verification, SSL_get_ex_data_X509_STORE_CTX_idx());
+    if (ssl == NULL) return 0;
+    SSL_CTX *context = SSL_get_SSL_CTX(ssl);
+    ziserver_client_policy *policy = SSL_CTX_get_ex_data(context, ziserver_client_policy_index);
+    STACK_OF(X509) *chain = X509_STORE_CTX_get0_chain(verification);
+    if (policy == NULL || chain == NULL || sk_X509_num(chain) == 0) return 0;
+    for (int i = 0; i < sk_X509_num(chain); ++i) {
+        int denied = ziserver_openssl_certificate_denied(sk_X509_value(chain, i),
+            &policy->cert_hashes[0][0], policy->cert_count,
+            &policy->spki_hashes[0][0], policy->spki_count);
+        if (denied != 0) {
+            X509_STORE_CTX_set_error(verification, denied > 0 ? X509_V_ERR_CERT_REVOKED : X509_V_ERR_APPLICATION_VERIFICATION);
+            return 0;
+        }
+    }
+    if (policy->response_count == 0) return 1;
+    X509 *leaf = sk_X509_value(chain, 0);
+    X509 *issuer = sk_X509_value(chain, sk_X509_num(chain) > 1 ? 1 : 0);
+    int found_good = 0;
+    for (size_t i = 0; i < policy->response_count; ++i) {
+        OCSP_BASICRESP *basic = policy->responses[i];
+        if (OCSP_basic_verify(basic, chain, SSL_CTX_get_cert_store(context), OCSP_NOEXPLICIT) != 1) continue;
+        for (int j = 0; j < OCSP_resp_count(basic); ++j) {
+            OCSP_SINGLERESP *single = OCSP_resp_get0(basic, j);
+            const OCSP_CERTID *response_id = OCSP_SINGLERESP_get0_id(single);
+            ASN1_OBJECT *algorithm = NULL;
+            if (OCSP_id_get0_info(NULL, &algorithm, NULL, NULL, (OCSP_CERTID *)response_id) != 1) continue;
+            const EVP_MD *digest = EVP_get_digestbyobj(algorithm);
+            if (digest == NULL) continue;
+            OCSP_CERTID *expected = OCSP_cert_to_id(digest, leaf, issuer);
+            if (expected == NULL) continue;
+            int matches = OCSP_id_cmp(expected, response_id) == 0;
+            OCSP_CERTID_free(expected);
+            if (!matches) continue;
+            int status = OCSP_single_get0_status(single, NULL, NULL, NULL, NULL);
+            if (status == V_OCSP_CERTSTATUS_REVOKED) {
+                X509_STORE_CTX_set_error(verification, X509_V_ERR_CERT_REVOKED);
+                return 0;
+            }
+            if (status == V_OCSP_CERTSTATUS_GOOD && ziserver_ocsp_current(single)) found_good = 1;
+        }
+    }
+    if (found_good) return 1;
+    X509_STORE_CTX_set_error(verification, X509_V_ERR_APPLICATION_VERIFICATION);
+    return 0;
+}
+
+static int ziserver_client_crls_valid(X509_STORE *store, const char *file) {
+    BIO *input = BIO_new_file(file, "rb");
+    if (input == NULL) return 0;
+    STACK_OF(X509_INFO) *entries = PEM_X509_INFO_read_bio(input, NULL, NULL, NULL);
+    BIO_free(input);
+    if (entries == NULL) return 0;
+    X509_STORE_CTX *verification = X509_STORE_CTX_new();
+    int valid = 0, count = 0;
+    if (verification == NULL || X509_STORE_CTX_init(verification, store, NULL, NULL) != 1) goto done;
+    for (int i = 0; i < sk_X509_INFO_num(entries); ++i) {
+        X509_CRL *crl = sk_X509_INFO_value(entries, i)->crl;
+        if (crl == NULL) continue;
+        if (++count > 64 || X509_CRL_get0_nextUpdate(crl) == NULL ||
+            X509_cmp_current_time(X509_CRL_get0_lastUpdate(crl)) >= 0 ||
+            X509_cmp_current_time(X509_CRL_get0_nextUpdate(crl)) <= 0) goto done;
+        STACK_OF(X509) *issuers = X509_STORE_CTX_get1_certs(verification, X509_CRL_get_issuer(crl));
+        int signature_valid = 0;
+        for (int j = 0; issuers != NULL && j < sk_X509_num(issuers); ++j) {
+            if (X509_CRL_verify(crl, X509_get0_pubkey(sk_X509_value(issuers, j))) == 1) signature_valid = 1;
+        }
+        sk_X509_pop_free(issuers, X509_free);
+        if (!signature_valid) goto done;
+    }
+    valid = count != 0;
+done:
+    X509_STORE_CTX_free(verification);
+    sk_X509_INFO_pop_free(entries, X509_INFO_free);
+    return valid;
+}
+
+int ziserver_openssl_server_ctx_client_auth(
+    SSL_CTX *context, const char *ca_file, const char *crl_file,
+    const char *const *ocsp_files, size_t ocsp_count,
+    const uint8_t *cert_hashes, size_t cert_count,
+    const uint8_t *spki_hashes, size_t spki_count
+) {
+    if (cert_count > 64 || spki_count > 64 || ocsp_count > 64 ||
+        CRYPTO_THREAD_run_once(&ziserver_client_policy_once, ziserver_client_policy_index_init) != 1 ||
+        ziserver_client_policy_index < 0 ||
+        SSL_CTX_load_verify_locations(context, ca_file, NULL) != 1) return 0;
+    X509_STORE *store = SSL_CTX_get_cert_store(context);
+    if (crl_file != NULL &&
+        (!ziserver_client_crls_valid(store, crl_file) ||
+         X509_STORE_load_file(store, crl_file) != 1 ||
+         X509_STORE_set_flags(store, X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL) != 1)) return 0;
+    ziserver_client_policy *policy = OPENSSL_zalloc(sizeof(*policy));
+    if (policy == NULL) return 0;
+    if (SSL_CTX_set_ex_data(context, ziserver_client_policy_index, policy) != 1) {
+        OPENSSL_free(policy);
+        return 0;
+    }
+    policy->cert_count = cert_count;
+    policy->spki_count = spki_count;
+    if (cert_count != 0) memcpy(policy->cert_hashes, cert_hashes, cert_count * 32);
+    if (spki_count != 0) memcpy(policy->spki_hashes, spki_hashes, spki_count * 32);
+    if (ocsp_count != 0) {
+        policy->responses = OPENSSL_zalloc(ocsp_count * sizeof(*policy->responses));
+        if (policy->responses == NULL) return 0;
+    }
+    for (size_t i = 0; i < ocsp_count; ++i) {
+        BIO *input = BIO_new_file(ocsp_files[i], "rb");
+        if (input == NULL) return 0;
+        OCSP_RESPONSE *response = d2i_OCSP_RESPONSE_bio(input, NULL);
+        BIO_free(input);
+        if (response == NULL) return 0;
+        if (OCSP_response_status(response) != OCSP_RESPONSE_STATUS_SUCCESSFUL) {
+            OCSP_RESPONSE_free(response);
+            return 0;
+        }
+        OCSP_BASICRESP *basic = OCSP_response_get1_basic(response);
+        OCSP_RESPONSE_free(response);
+        if (basic == NULL) return 0;
+        policy->responses[policy->response_count++] = basic;
+        if (OCSP_basic_verify(basic, NULL, store, OCSP_NOEXPLICIT) != 1) return 0;
+        for (int j = 0; j < OCSP_resp_count(basic); ++j) {
+            if (!ziserver_ocsp_current(OCSP_resp_get0(basic, j))) return 0;
+        }
+    }
+    STACK_OF(X509_NAME) *names = SSL_load_client_CA_file(ca_file);
+    if (names == NULL) return 0;
+    SSL_CTX_set_client_CA_list(context, names);
+    // A resumed session can skip certificate verification callbacks. Require
+    // fresh CRL/OCSP checks on every mTLS handshake, including after expiry.
+    SSL_CTX_set_session_cache_mode(context, SSL_SESS_CACHE_OFF);
+    SSL_CTX_set_options(context, SSL_OP_NO_TICKET);
+    if (SSL_CTX_set_num_tickets(context, 0) != 1) return 0;
+    SSL_CTX_set_verify(context, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, ziserver_client_verify);
+    return 1;
 }
 
 SSL_CTX *ziserver_openssl_client_ctx_new(int verify_peer) {

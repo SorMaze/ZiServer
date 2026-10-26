@@ -19,6 +19,7 @@
 
 ## 部署与运维
 
+- [TLS 证书停用、热替换与客户端吊销校验](zh-CN/operations/tls-certificate-lifecycle.md)：无需重启换证、紧急停用、mTLS、CRL 和 OCSP。
 - [客户端 IP 与限流部署](zh-CN/operations/client-ip-rate-limit.md)：直连、可信代理、容量和隐私。
 - [协议纠正重定向 Host 策略](zh-CN/operations/redirect-host-policy.md)：canonical/allowlist/fallback 规则。
 - [按客户端 IP 限流实施清单](zh-CN/operations/rate-limit-client-ip-checklist.md)：历史核查、实现状态和验收门槛。

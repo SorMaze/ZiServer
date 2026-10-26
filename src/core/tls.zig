@@ -43,6 +43,36 @@ pub const NegotiatedProtocol = enum {
 pub const ServerContext = struct {
     provider: Provider,
     handle: ?*anyopaque = null,
+    mutex: std.Io.Mutex = .init,
+    generation: u64 = 1,
+    client_auth_required: bool = false,
+
+    pub fn requiresClientAuth(self: *ServerContext, io: std.Io) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.client_auth_required;
+    }
+
+    /// Publish the connection's generation before releasing the context lock.
+    /// A concurrent revocation can then find even a not-yet-started handshake.
+    pub fn acquire(self: *ServerContext, io: std.Io, connection_generation: *std.atomic.Value(u64)) !ServerContext {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const handle = self.handle orelse return error.TlsCertificateRevoked;
+        if (self.provider != .openssl) return error.TlsProviderUnavailable;
+        try openssl_backend.retainServerHandle(handle);
+        connection_generation.store(self.generation, .release);
+        return .{ .provider = self.provider, .handle = handle, .generation = self.generation };
+    }
+
+    pub fn denied(self: *const ServerContext, cert_hashes: []const [32]u8, spki_hashes: []const [32]u8) !bool {
+        return openssl_backend.serverHandleDenied(self.handle orelse return false, cert_hashes, spki_hashes);
+    }
+
+    pub fn configureClientAuth(self: *ServerContext, allocator: std.mem.Allocator, ca_file: []const u8, crl_file: ?[]const u8, ocsp_files: []const []const u8, cert_hashes: []const [32]u8, spki_hashes: []const [32]u8) !void {
+        try openssl_backend.configureClientAuth(self.handle orelse return error.TlsProviderUnavailable, allocator, ca_file, crl_file, ocsp_files, cert_hashes, spki_hashes);
+        self.client_auth_required = true;
+    }
 
     pub fn deinit(self: *ServerContext) void {
         switch (self.provider) {

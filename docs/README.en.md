@@ -22,6 +22,7 @@ Documentation is grouped by purpose. The root [`README.md`](../README.md) provid
 
 ## Operations
 
+- [Certificate revocation and replacement](en/operations/tls-certificate-lifecycle.md): in-process rotation, emergency disable, mTLS, CRL and OCSP.
 - [Client IP and rate-limit deployment](en/operations/client-ip-rate-limit.md): direct deployment, trusted proxies, capacity, and privacy.
 - [Protocol-correction redirect Host policy](en/operations/redirect-host-policy.md): canonical, allowlist, and fallback rules.
 - [Per-client-IP rate-limit checklist](en/operations/rate-limit-client-ip-checklist.md): historical review, implementation status, and acceptance gates.

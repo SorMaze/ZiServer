@@ -1,6 +1,7 @@
 test {
     _ = @import("layering_tests.zig");
     _ = @import("core/config.zig");
+    _ = @import("core/tls_control.zig");
     _ = @import("core/client_identity.zig");
     _ = @import("core/rate_limiter.zig");
     _ = @import("core/protocol_redirect.zig");

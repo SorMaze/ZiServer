@@ -128,10 +128,23 @@ jobs:
             --server="$server" \
             --log-file="$RUNNER_TEMP/ziserver-smoke/server.log"
 
+      - name: TLS certificate lifecycle regressions
+        if: matrix.tls_args == ''
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check -r scripts/requirements-tls-test.txt
+          python scripts/tls-test-fixtures.py "$RUNNER_TEMP/ziserver-tls"
+          server=zig-out/bin/ziserver
+          if [ "$RUNNER_OS" = Windows ]; then server=$server.exe; fi
+          node scripts/tls-reload-test.mjs \
+            --server="$server" \
+            --fixtures="$RUNNER_TEMP/ziserver-tls" \
+            --log-file="$RUNNER_TEMP/ziserver-smoke/tls-lifecycle.log"
+
       - name: Upload smoke log
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}-smoke-log
-          path: ${{ runner.temp }}/ziserver-smoke/server.log
+          path: ${{ runner.temp }}/ziserver-smoke/*.log
           if-no-files-found: ignore

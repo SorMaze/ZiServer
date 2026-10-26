@@ -27,21 +27,24 @@ pub const Connection = struct {
     tls_connection: ?tls.Connection = null,
     timeout_mutex: std.Io.Mutex = .init,
     read_deadline_ns: i96 = 0,
+    tls_generation: std.atomic.Value(u64) = .init(0),
 
     pub fn init(io: std.Io, stream: Stream) Connection {
         return .{ .io = io, .stream = stream };
     }
 
-    pub fn initTls(io: std.Io, stream: Stream, server_context: *const tls.ServerContext) !Connection {
+    pub fn initTls(io: std.Io, stream: Stream, server_context: *tls.ServerContext) !Connection {
         var connection = init(io, stream);
         try connection.enableTls(server_context);
         return connection;
     }
 
-    pub fn enableTls(self: *Connection, server_context: *const tls.ServerContext) !void {
+    pub fn enableTls(self: *Connection, server_context: *tls.ServerContext) !void {
+        var lease = try server_context.acquire(self.io, &self.tls_generation);
+        defer lease.deinit();
         const read_deadline_ns = self.readDeadlineNs();
         const tls_connection = tls.initConnection(
-            server_context,
+            &lease,
             self.io,
             socketHandleValue(self.stream),
             @intCast(read_deadline_ns),
@@ -241,6 +244,27 @@ pub const ConnectionRegistry = struct {
         defer self.mutex.unlock(self.io);
         for (self.slots) |maybe_connection| {
             if (maybe_connection) |connection| connection.shutdown();
+        }
+    }
+
+    pub fn shutdownTlsBefore(self: *ConnectionRegistry, generation: u64) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.slots) |maybe_connection| {
+            if (maybe_connection) |connection| {
+                const used_generation = connection.tls_generation.load(.acquire);
+                if (used_generation != 0 and used_generation < generation) connection.shutdown();
+            }
+        }
+    }
+
+    pub fn shutdownPlain(self: *ConnectionRegistry) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.slots) |maybe_connection| {
+            if (maybe_connection) |connection| {
+                if (connection.tls_generation.load(.acquire) == 0) connection.shutdown();
+            }
         }
     }
 };

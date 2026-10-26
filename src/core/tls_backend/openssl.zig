@@ -14,6 +14,9 @@ extern fn ziserver_openssl_server_ctx_new(
     advertise_h2: c_int,
 ) ?*anyopaque;
 extern fn ziserver_openssl_server_ctx_free(ctx: ?*anyopaque) void;
+extern fn ziserver_openssl_server_ctx_retain(ctx: *anyopaque) c_int;
+extern fn ziserver_openssl_server_ctx_denied(ctx: *anyopaque, cert_hashes: [*]const [32]u8, cert_count: usize, spki_hashes: [*]const [32]u8, spki_count: usize) c_int;
+extern fn ziserver_openssl_server_ctx_client_auth(ctx: *anyopaque, ca_file: [*:0]const u8, crl_file: ?[*:0]const u8, ocsp_files: [*]const [*:0]const u8, ocsp_count: usize, cert_hashes: [*]const [32]u8, cert_count: usize, spki_hashes: [*]const [32]u8, spki_count: usize) c_int;
 extern fn ziserver_openssl_client_ctx_new(verify_peer: c_int) ?*anyopaque;
 extern fn ziserver_openssl_client_ctx_free(ctx: ?*anyopaque) void;
 extern fn ziserver_openssl_last_error() c_ulong;
@@ -124,6 +127,37 @@ pub fn initServerHandle(
 
 pub fn freeServerHandle(handle: ?*anyopaque) void {
     if (linked) ziserver_openssl_server_ctx_free(handle);
+}
+
+pub fn retainServerHandle(handle: *anyopaque) !void {
+    if (!linked) return error.TlsProviderUnavailable;
+    if (ziserver_openssl_server_ctx_retain(handle) != 1) return error.TlsContextRetainFailed;
+}
+
+pub fn serverHandleDenied(handle: *anyopaque, cert_hashes: []const [32]u8, spki_hashes: []const [32]u8) !bool {
+    if (!linked) return error.TlsProviderUnavailable;
+    return switch (ziserver_openssl_server_ctx_denied(handle, cert_hashes.ptr, cert_hashes.len, spki_hashes.ptr, spki_hashes.len)) {
+        0 => false,
+        1 => true,
+        else => error.TlsCertificateInspectionFailed,
+    };
+}
+
+pub fn configureClientAuth(handle: *anyopaque, allocator: std.mem.Allocator, ca_file: []const u8, crl_file: ?[]const u8, ocsp_files: []const []const u8, cert_hashes: []const [32]u8, spki_hashes: []const [32]u8) !void {
+    if (!linked) return error.TlsProviderUnavailable;
+    const ca_z = try allocator.dupeSentinel(u8, ca_file, 0);
+    defer allocator.free(ca_z);
+    const crl_z = if (crl_file) |file| try allocator.dupeSentinel(u8, file, 0) else null;
+    defer if (crl_z) |file| allocator.free(file);
+    const files = try allocator.alloc([*:0]const u8, ocsp_files.len);
+    defer allocator.free(files);
+    var initialized: usize = 0;
+    defer for (files[0..initialized]) |file| allocator.free(std.mem.span(file));
+    for (ocsp_files, files) |file, *target| {
+        target.* = try allocator.dupeSentinel(u8, file, 0);
+        initialized += 1;
+    }
+    if (ziserver_openssl_server_ctx_client_auth(handle, ca_z.ptr, if (crl_z) |file| file.ptr else null, files.ptr, files.len, cert_hashes.ptr, cert_hashes.len, spki_hashes.ptr, spki_hashes.len) != 1) return error.TlsClientAuthInitFailed;
 }
 
 pub fn initClientHandle(verify_peer: bool) !*anyopaque {
