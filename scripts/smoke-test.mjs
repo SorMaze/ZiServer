@@ -164,11 +164,12 @@ async function runSoak(port, duration) {
   const result = spawnSync(process.execPath, [
     script,
     `--origin=https://127.0.0.1:${port}`,
+    `--path=${stringOption('soak-path', '/about')}`,
     '--connections=2',
     '--streams=4',
     `--duration=${duration}`,
-    '--grace=30',
-  ], { encoding: 'utf8', timeout: (duration + 45) * 1000 });
+    '--grace=10',
+  ], { encoding: 'utf8', timeout: (duration + 30) * 1000 });
   process.stdout.write(result.stdout);
   process.stderr.write(result.stderr);
   assert.equal(result.status, 0, 'HTTP/2 soak failed');
@@ -192,11 +193,11 @@ const args = [
   '--host=127.0.0.1',
   `--http-port=${httpPort}`,
   `--https-port=${httpsPort}`,
-  '--no-access-log',
   '--keep-alive=1000000',
   '--log-format=json',
   '--log-color=off',
 ];
+if (!process.argv.includes('--access-log')) args.push('--no-access-log');
 if (tlsCert) {
   args.push(`--tls-cert=${path.resolve(tlsCert)}`, `--tls-key=${path.resolve(tlsKey)}`, '--http2=on');
 } else {

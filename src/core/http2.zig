@@ -449,7 +449,13 @@ fn dispatchStartBridge(
         .request_source = undefined,
     };
     task.request_source = .{ .io = bridge.connection.io, .queue = &task.request_queue };
-    task.future = bridge.connection.io.async(runDispatchTask, .{task});
+    task.future = bridge.connection.io.concurrent(runDispatchTask, .{task}) catch {
+        task.request_queue.deinit(bridge.connection.io);
+        task.response_queue.deinit(bridge.connection.io);
+        task.request.deinit();
+        capture_allocator.destroy(task);
+        return -1;
+    };
     task_out.* = task;
     return 0;
 }
