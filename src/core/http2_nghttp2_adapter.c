@@ -681,6 +681,17 @@ static int ziserver_h2_poll_ready_dispatches(
     }
 }
 
+static int ziserver_h2_poll_all_dispatches(
+    nghttp2_session *session,
+    ziserver_h2_session *context
+) {
+    for (ziserver_h2_stream *stream = context->streams; stream != NULL; stream = stream->next) {
+        int result = ziserver_h2_poll_dispatch(session, context, stream);
+        if (result != 0) return result;
+    }
+    return 0;
+}
+
 static int ziserver_h2_on_stream_close(
     nghttp2_session *session,
     int32_t stream_id,
@@ -846,6 +857,9 @@ int ziserver_nghttp2_serve(
                 continue;
             }
             response_poll_spins = 0;
+            result = ziserver_h2_poll_all_dispatches(session, &context);
+            if (result == 0) result = nghttp2_session_send(session);
+            if (result != 0) break;
             // Dispatch tasks can finish while the socket is idle. Keep this
             // bounded wait as a slow-handler fallback, but let immediate
             // ready-queue responses avoid the platform timer quantum above.
