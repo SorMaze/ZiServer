@@ -10,9 +10,9 @@ app  ->  ziserver public facade  ->  compose  ->  core
 
 ## 平台范围
 
-当前只有 **Windows x86_64** 被视为可用：已在该平台完成构建、功能回归、HTTP/2 长稳态和内存稳定性验证。Windows TLS/HTTP/2 的已验证组合是 vcpkg 提供的 OpenSSL + nghttp2，并使用 Windows 专用 AFD 可取消读取路径实现 socket deadline。
+CI 构建矩阵已覆盖 **Windows x86_64** 与 **Linux x86_64**；对应的本机/VMware 原生验证已通过单元测试、协议 smoke、流式请求和短时 HTTP/2 soak，POSIX 路径覆盖 SIGTERM 优雅停机。Windows TLS/HTTP/2 的已验证组合是 vcpkg 提供的 OpenSSL + nghttp2，并使用 Windows 专用 AFD 可取消读取路径实现 socket deadline；Windows 另有长稳态和内存稳定性验证。
 
-Linux、macOS 与其他目标仍保留部分 `std.Io` 可移植路径，但没有同等级 CI、协议回归、长稳态压测或发行验证；当前不能宣称受支持。SChannel 后端仅为占位；原生 HTTP/3 仍是实验性单连接实现，尚未完成多连接、GOAWAY 和完整 router/middleware 集成。
+Linux 尚无同等级的长稳态、内存稳定性或发行验证；macOS 与其他目标仍不能宣称受支持。SChannel 后端仅为占位；原生 HTTP/3 仍是实验性单连接实现，尚未完成多连接、GOAWAY 和完整 router/middleware 集成。
 
 `main.zig` 是最小 composition root，直接调用 `core/server.zig`，并把具体 application factory 作为回调注入。core 负责解析启动配置、持有核心资源和运行服务器；factory 位于 app，通过公共门面使用 compose。core 不导入 compose/app，compose 不反向导入 app。
 

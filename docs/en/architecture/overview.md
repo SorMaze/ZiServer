@@ -15,9 +15,9 @@ app  ->  ziserver public facade  ->  compose  ->  core
 
 ## Platform scope
 
-Only **Windows x86_64** is currently considered usable: builds, functional regressions, long-running HTTP/2 tests, and memory-stability checks have all been completed on that platform. The validated Windows TLS/HTTP/2 combination is vcpkg-provided OpenSSL + nghttp2, with a Windows-specific AFD cancellable-read path for socket deadlines.
+The CI build matrix now covers **Windows x86_64** and **Linux x86_64**. Corresponding native host/VMware validation has passed unit tests, protocol smoke checks, streaming requests, and short HTTP/2 soak tests; the POSIX path also covers graceful SIGTERM shutdown. The validated Windows TLS/HTTP/2 combination is vcpkg-provided OpenSSL + nghttp2, with a Windows-specific AFD cancellable-read path for socket deadlines; Windows has additional long-running and memory-stability validation.
 
-Linux, macOS, and other targets retain some portable `std.Io` paths, but lack equivalent CI, protocol regressions, long-running load tests, and release validation; they must not currently be presented as supported. The SChannel backend is a placeholder. Native HTTP/3 is still experimental single-connection work without completed multi-connection, GOAWAY, or full router/middleware integration.
+Linux still lacks equivalent long-running, memory-stability, and release validation. macOS and other targets must not currently be presented as supported. The SChannel backend is a placeholder. Native HTTP/3 is still experimental single-connection work without completed multi-connection, GOAWAY, or full router/middleware integration.
 
 `main.zig` is the minimal composition root. It calls `core/server.zig` directly and injects the concrete application factory as a callback. Core parses startup configuration, owns core resources, and runs the server. The factory lives in app and uses compose through the public facade. Core never imports compose/app, and compose never imports app.
 

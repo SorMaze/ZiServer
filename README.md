@@ -10,9 +10,23 @@ Detailed documentation is available in the [documentation center](docs/README.en
 
 ## Platform support and current limits
 
-**Windows x86_64** is the only platform currently validated through builds, functional regressions, HTTP/2 soak testing, and memory-stability checks. Windows uses vcpkg-provided OpenSSL/nghttp2 and includes the Windows-specific AFD cancellable socket-read path.
+**Windows x86_64** and **Linux x86_64** have passed Debug/ReleaseFast builds, unit tests, default and minimal providers, filesystem/embedded static modes, HTTP/1.1, TLS/HTTP/2, streaming requests, and short HTTP/2 soak tests. The POSIX path also verifies graceful SIGTERM shutdown. Windows uses vcpkg-provided OpenSSL/nghttp2 and its AFD cancellable socket-read path, and has additional long-running and memory-stability validation records.
 
-Linux, macOS, and other targets retain some portable code and `std.Io` deadline paths, but have not received equivalent CI, protocol regression, long-running load testing, or release validation. They must not currently be presented as supported platforms. The Windows SChannel provider is still a placeholder; the validated TLS/HTTP/2 combination is OpenSSL + nghttp2. Native HTTP/3 remains an experimental single-connection implementation without production multi-connection, GOAWAY, or complete router/middleware integration.
+Linux has not yet received equivalent long-running, memory-stability, or release validation. macOS and other targets must not currently be presented as supported. The Windows SChannel provider is still a placeholder; the validated TLS/HTTP/2 combination is OpenSSL + nghttp2. Native HTTP/3 remains an experimental single-connection implementation without production multi-connection, GOAWAY, or complete router/middleware integration.
+
+## CI and runtime regressions
+
+`.github/workflows/ci.yml` pins Zig 0.17.0 on Ubuntu and Windows, covers Debug/ReleaseFast, OpenSSL+nghttp2/`-Dtls=none`, and filesystem/embedded static modes, and runs builds, unit tests, and runtime smoke checks.
+
+```bash
+# Plaintext HTTP/1.1, static assets, JSON, and streaming
+node scripts/smoke-test.mjs
+
+# Add TLS, HTTP/2, and a 5-second concurrent soak; POSIX also checks SIGTERM
+node scripts/smoke-test.mjs --tls-cert=.dev-certs/localhost.pem --tls-key=.dev-certs/localhost.key --soak-duration=5
+```
+
+On Ubuntu/Debian, install default-provider build dependencies with `sudo apt-get install libssl-dev libnghttp2-dev`. Smoke tests also require Node.js; TLS smoke requires `openssl` or an existing test certificate.
 
 ## Quick start
 

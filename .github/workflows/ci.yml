@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test-smoke:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-debug-full
+            os: ubuntu-latest
+            optimize: Debug
+            static: filesystem
+            tls_args: ""
+          - name: linux-release-full-embedded
+            os: ubuntu-latest
+            optimize: ReleaseFast
+            static: embedded
+            tls_args: ""
+          - name: linux-debug-minimal
+            os: ubuntu-latest
+            optimize: Debug
+            static: filesystem
+            tls_args: -Dtls=none
+          - name: linux-release-minimal-embedded
+            os: ubuntu-latest
+            optimize: ReleaseFast
+            static: embedded
+            tls_args: -Dtls=none
+          - name: windows-debug-full
+            os: windows-latest
+            optimize: Debug
+            static: filesystem
+            tls_args: ""
+          - name: windows-release-full-embedded
+            os: windows-latest
+            optimize: ReleaseFast
+            static: embedded
+            tls_args: ""
+          - name: windows-debug-minimal
+            os: windows-latest
+            optimize: Debug
+            static: filesystem
+            tls_args: -Dtls=none
+          - name: windows-release-minimal-embedded
+            os: windows-latest
+            optimize: ReleaseFast
+            static: embedded
+            tls_args: -Dtls=none
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Install Linux TLS dependencies
+        if: matrix.os == 'ubuntu-latest' && matrix.tls_args == ''
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev libnghttp2-dev openssl
+
+      - name: Install Windows TLS dependencies
+        if: matrix.os == 'windows-latest' && matrix.tls_args == ''
+        shell: pwsh
+        run: vcpkg install openssl:x64-windows nghttp2:x64-windows
+
+      - name: Build
+        run: zig build -Dartifact=all -Doptimize=${{ matrix.optimize }} -Dstatic=${{ matrix.static }} ${{ matrix.tls_args }}
+
+      - name: Unit tests and compile checks
+        run: zig build test -Doptimize=${{ matrix.optimize }} -Dstatic=${{ matrix.static }} ${{ matrix.tls_args }}
+
+      - name: Check smoke script
+        run: node --check scripts/smoke-test.mjs
+
+      - name: Generate smoke certificate
+        if: matrix.tls_args == ''
+        shell: bash
+        env:
+          MSYS_NO_PATHCONV: "1"
+        run: |
+          mkdir -p "$RUNNER_TEMP/ziserver-smoke"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -subj '/CN=localhost' \
+            -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' \
+            -keyout "$RUNNER_TEMP/ziserver-smoke/key.pem" \
+            -out "$RUNNER_TEMP/ziserver-smoke/cert.pem"
+
+      - name: Full protocol smoke
+        if: matrix.tls_args == ''
+        shell: bash
+        run: |
+          server=zig-out/bin/ziserver
+          if [ "$RUNNER_OS" = Windows ]; then server=$server.exe; fi
+          node scripts/smoke-test.mjs \
+            --server="$server" \
+            --tls-cert="$RUNNER_TEMP/ziserver-smoke/cert.pem" \
+            --tls-key="$RUNNER_TEMP/ziserver-smoke/key.pem" \
+            --soak-duration=5 \
+            --log-file="$RUNNER_TEMP/ziserver-smoke/server.log"
+
+      - name: Minimal HTTP smoke
+        if: matrix.tls_args != ''
+        shell: bash
+        run: |
+          server=zig-out/bin/ziserver
+          if [ "$RUNNER_OS" = Windows ]; then server=$server.exe; fi
+          node scripts/smoke-test.mjs \
+            --server="$server" \
+            --log-file="$RUNNER_TEMP/ziserver-smoke/server.log"
+
+      - name: Upload smoke log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}-smoke-log
+          path: ${{ runner.temp }}/ziserver-smoke/server.log
+          if-no-files-found: ignore

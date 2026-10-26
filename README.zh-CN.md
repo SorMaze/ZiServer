@@ -10,9 +10,23 @@ socket 写入路径使用 Zig 0.17 的 `std.Io.operate(.net_write)` API，替代
 
 ## 平台支持与当前限制
 
-当前唯一经过构建、功能回归、HTTP/2 soak 和内存稳定性验证的平台是 **Windows x86_64**。Windows 使用 vcpkg 提供的 OpenSSL/nghttp2，并包含 Windows 专用的 AFD 可取消 socket 读取路径。
+**Windows x86_64** 与 **Linux x86_64** 已通过 Debug/ReleaseFast 构建、单元测试、默认及精简 provider、filesystem/embedded static、HTTP/1.1、TLS/HTTP/2、流式请求和短时 HTTP/2 soak；POSIX 路径还验证了 SIGTERM 优雅停机。Windows 使用 vcpkg 提供的 OpenSSL/nghttp2，包含专用的 AFD 可取消 socket 读取路径，并另有长稳态和内存稳定性验证记录。
 
-Linux、macOS 及其他目标虽然保留了部分可移植代码和 `std.Io` deadline 路径，但尚未完成同等级的 CI、协议回归、长稳态压测或发布验证，因此当前不应宣称为受支持平台。Windows SChannel provider 仍是占位；TLS/HTTP/2 的已验证组合是 OpenSSL + nghttp2。原生 HTTP/3 仍为实验性单连接实现，未完成生产级多连接、GOAWAY 与完整 router/middleware 集成。
+Linux 尚未完成与 Windows 同等级的长稳态、内存稳定性或发布验证；macOS 及其他目标仍不应宣称为受支持平台。Windows SChannel provider 仍是占位；TLS/HTTP/2 的已验证组合是 OpenSSL + nghttp2。原生 HTTP/3 仍为实验性单连接实现，未完成生产级多连接、GOAWAY 与完整 router/middleware 集成。
+
+## CI 与运行时回归
+
+`.github/workflows/ci.yml` 在 Ubuntu 和 Windows 上固定 Zig 0.17.0，覆盖 Debug/ReleaseFast、OpenSSL+nghttp2/`-Dtls=none` 和 filesystem/embedded static，并执行构建、单元测试及运行时 smoke。
+
+```bash
+# 明文 HTTP/1.1、静态资源、JSON 和流式请求
+node scripts/smoke-test.mjs
+
+# 增加 TLS、HTTP/2 和 5 秒并发 soak；POSIX 同时验证 SIGTERM
+node scripts/smoke-test.mjs --tls-cert=.dev-certs/localhost.pem --tls-key=.dev-certs/localhost.key --soak-duration=5
+```
+
+Ubuntu/Debian 的默认 provider 构建依赖可通过 `sudo apt-get install libssl-dev libnghttp2-dev` 安装，smoke 还需要 Node.js；TLS smoke 需要 `openssl` 或已有测试证书。
 
 ## 运行
 

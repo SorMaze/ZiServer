@@ -30,7 +30,7 @@
 9. **可观测性**：Prometheus/OpenTelemetry 导出、按协议/状态码/路由的延迟直方图，以及异步结构化日志 sink。
 10. **TLS 生命周期**：完成 SChannel provider，支持证书热更新/轮换，并覆盖握手失败、ALPN 和关闭路径测试。
 11. **配置热更新**：对可安全更新的超时、限流、日志和缓存策略提供原子配置快照；监听地址/线程模型继续要求重启。
-12. **自动化质量门禁**：补充 CI（Debug/ReleaseFast、TLS/HTTP2 开关、embedded static、主要平台）、parser fuzz、长连接/优雅停机回归和 sanitizer/泄漏检查。
+12. **自动化质量门禁（基础完成）**：GitHub Actions 已覆盖 Ubuntu/Windows、Debug/ReleaseFast、TLS/HTTP2 开关、filesystem/embedded static、单元测试、协议/流式 smoke、短时 HTTP/2 soak 和 POSIX SIGTERM 回归。后续继续补 parser fuzz、长稳态与内存曲线、sanitizer/泄漏检查及 macOS 验证。
 
 ## 推荐顺序
 
