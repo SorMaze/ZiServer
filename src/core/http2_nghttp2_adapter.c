@@ -15,6 +15,18 @@
 // tick even though no socket activity is needed to produce the response.
 #define ZISERVER_H2_RESPONSE_POLL_SPINS 1024
 
+#if NGHTTP2_VERSION_NUM >= 0x013c00
+#define ziserver_h2_ssize nghttp2_ssize
+#define ziserver_h2_data_provider nghttp2_data_provider2
+#define ziserver_nghttp2_submit_response nghttp2_submit_response2
+#define ziserver_nghttp2_session_mem_recv nghttp2_session_mem_recv2
+#else
+#define ziserver_h2_ssize ssize_t
+#define ziserver_h2_data_provider nghttp2_data_provider
+#define ziserver_nghttp2_submit_response nghttp2_submit_response
+#define ziserver_nghttp2_session_mem_recv nghttp2_session_mem_recv
+#endif
+
 typedef struct {
     const uint8_t *name_ptr;
     size_t name_len;
@@ -396,7 +408,7 @@ static int ziserver_h2_on_data_chunk(
     return append_result == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
 }
 
-static nghttp2_ssize ziserver_h2_read_response(
+static ziserver_h2_ssize ziserver_h2_read_response(
     nghttp2_session *session,
     int32_t stream_id,
     uint8_t *buffer,
@@ -419,7 +431,7 @@ static nghttp2_ssize ziserver_h2_read_response(
             &end_stream
         );
         if (end_stream != 0) *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-        if (result > 0) return (nghttp2_ssize)result;
+        if (result > 0) return (ziserver_h2_ssize)result;
         if (result == 0) {
             *data_flags |= NGHTTP2_DATA_FLAG_EOF;
             return 0;
@@ -436,7 +448,7 @@ static nghttp2_ssize ziserver_h2_read_response(
     if (stream->response_body_offset == stream->response_body_len) {
         *data_flags |= NGHTTP2_DATA_FLAG_EOF;
     }
-    return (nghttp2_ssize)amount;
+    return (ziserver_h2_ssize)amount;
 }
 
 static nghttp2_nv ziserver_h2_nv(
@@ -545,14 +557,14 @@ static int ziserver_h2_submit_response(
         );
     }
 
-    nghttp2_data_provider2 provider;
-    nghttp2_data_provider2 *provider_ptr = NULL;
+    ziserver_h2_data_provider provider;
+    ziserver_h2_data_provider *provider_ptr = NULL;
     if (stream->streaming_response || stream->response_body_len != 0) {
         provider.source.ptr = stream;
         provider.read_callback = ziserver_h2_read_response;
         provider_ptr = &provider;
     }
-    int result = nghttp2_submit_response2(
+    int result = ziserver_nghttp2_submit_response(
         session,
         stream->stream_id,
         headers,
@@ -878,7 +890,7 @@ int ziserver_nghttp2_serve(
             result = NGHTTP2_ERR_CALLBACK_FAILURE;
             break;
         }
-        nghttp2_ssize consumed = nghttp2_session_mem_recv2(session, input, (size_t)read_result);
+        ziserver_h2_ssize consumed = ziserver_nghttp2_session_mem_recv(session, input, (size_t)read_result);
         if (consumed < 0 || consumed != read_result) {
             result = consumed < 0 ? (int)consumed : NGHTTP2_ERR_PROTO;
             break;

@@ -42,11 +42,13 @@ jobs:
             optimize: Debug
             static: filesystem
             tls_args: ""
+            openssl_args: -Dopenssl-ssl-lib=libssl -Dopenssl-crypto-lib=libcrypto
           - name: windows-release-full-embedded
             os: windows-latest
             optimize: ReleaseFast
             static: embedded
             tls_args: ""
+            openssl_args: -Dopenssl-ssl-lib=libssl -Dopenssl-crypto-lib=libcrypto
           - name: windows-debug-minimal
             os: windows-latest
             optimize: Debug
@@ -64,6 +66,14 @@ jobs:
         with:
           version: 0.17.0
 
+      - name: Use Linux system dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          echo 'VCPKG_ROOT=' >> "$GITHUB_ENV"
+          echo 'VCPKG_INSTALLATION_ROOT=' >> "$GITHUB_ENV"
+          echo 'VCPKG_HOME=' >> "$GITHUB_ENV"
+          echo 'Vcpkg_home=' >> "$GITHUB_ENV"
+
       - name: Install Linux TLS dependencies
         if: matrix.os == 'ubuntu-latest' && matrix.tls_args == ''
         run: sudo apt-get update && sudo apt-get install -y libssl-dev libnghttp2-dev openssl
@@ -74,10 +84,10 @@ jobs:
         run: vcpkg install openssl:x64-windows nghttp2:x64-windows
 
       - name: Build
-        run: zig build -Dartifact=all -Doptimize=${{ matrix.optimize }} -Dstatic=${{ matrix.static }} ${{ matrix.tls_args }}
+        run: zig build -Dartifact=all -Doptimize=${{ matrix.optimize }} -Dstatic=${{ matrix.static }} ${{ matrix.tls_args }} ${{ matrix.openssl_args }}
 
       - name: Unit tests and compile checks
-        run: zig build test -Doptimize=${{ matrix.optimize }} -Dstatic=${{ matrix.static }} ${{ matrix.tls_args }}
+        run: zig build test -Doptimize=${{ matrix.optimize }} -Dstatic=${{ matrix.static }} ${{ matrix.tls_args }} ${{ matrix.openssl_args }}
 
       - name: Check smoke script
         run: node --check scripts/smoke-test.mjs

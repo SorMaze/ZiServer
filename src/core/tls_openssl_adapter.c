@@ -200,7 +200,12 @@ static int ziserver_openssl_select_alpn(
         2, 'h', '2',
         8, 'h', 't', 't', 'p', '/', '1', '.', '1'
     };
+#if OPENSSL_VERSION_NUMBER >= 0x30200000L
     const int is_quic = SSL_is_quic(ssl);
+#else
+    (void)ssl;
+    const int is_quic = 0;
+#endif
     const unsigned char *protocols = is_quic ? h3 : (arg == NULL ? http11 : h2_http11);
     unsigned int protocols_len = is_quic ? sizeof(h3) : (arg == NULL ? sizeof(http11) : sizeof(h2_http11));
 
