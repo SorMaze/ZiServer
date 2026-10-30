@@ -691,7 +691,7 @@ fn printUsage() void {
         \\  --keep-alive=N max requests per connection, 0 disables connection reuse
         \\  --tls-handshake-timeout=MS TLS handshake deadline, default 10000; 0 disables
         \\  --header-timeout=MS request header deadline, default 10000; 0 disables
-        \\  --body-timeout=MS request body deadline, default 30000; 0 disables
+        \\  --body-timeout=MS request body and response write deadline, default 30000; 0 disables
         \\  --keep-alive-timeout=MS idle connection deadline, default 15000; 0 disables
         \\  --shutdown-grace=MS graceful drain deadline, default 30000
         \\  --stats=on|off enable or disable atomic live stats, default on

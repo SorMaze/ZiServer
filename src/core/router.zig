@@ -133,7 +133,7 @@ pub const Table = struct {
         }
 
         if (request.method == .get or request.method == .head) {
-            if (try store.resolve(request.path)) |asset| return .{ .static = asset };
+            if (try store.resolve(request.path, request.method == .head)) |asset| return .{ .static = asset };
             return .not_found;
         }
 

@@ -8,6 +8,7 @@ pub const embedded_available = std.mem.eql(u8, build_options.static_mode, "embed
 pub const Asset = struct {
     path: []const u8,
     body: []const u8,
+    size: usize = 0,
     content_type: []const u8,
     cache: http_config.CachePolicy,
     owned: bool = false,
@@ -39,14 +40,14 @@ pub const Store = struct {
         };
     }
 
-    pub fn resolve(self: Store, path: []const u8) !?Asset {
+    pub fn resolve(self: Store, path: []const u8, metadata_only: bool) !?Asset {
         return switch (self.mode) {
             .embedded => findEmbedded(path),
-            .filesystem => try self.findFilesystem(path),
+            .filesystem => try self.findFilesystem(path, metadata_only),
         };
     }
 
-    fn findFilesystem(self: Store, path: []const u8) !?Asset {
+    fn findFilesystem(self: Store, path: []const u8, metadata_only: bool) !?Asset {
         const io = self.io.?;
         const allocator = self.allocator.?;
         var relative_buffer: [512]u8 = undefined;
@@ -54,6 +55,24 @@ pub const Store = struct {
 
         var file_path_buffer: [1024]u8 = undefined;
         const file_path = try joinRoot(self.root_dir, relative_path, &file_path_buffer);
+        if (metadata_only) {
+            const stat = std.Io.Dir.cwd().statFile(io, file_path, .{}) catch |err| switch (err) {
+                error.FileNotFound,
+                error.IsDir,
+                error.NotDir,
+                error.AccessDenied,
+                => return null,
+                else => return err,
+            };
+            if (stat.kind != .file or stat.size > http_config.max_static_file_bytes) return null;
+            return .{
+                .path = path,
+                .body = &.{},
+                .size = @intCast(stat.size),
+                .content_type = contentTypeForPath(relative_path),
+                .cache = cachePolicyForPath(relative_path),
+            };
+        }
         const body = std.Io.Dir.cwd().readFileAlloc(
             io,
             file_path,
@@ -72,6 +91,7 @@ pub const Store = struct {
         return .{
             .path = path,
             .body = body,
+            .size = body.len,
             .content_type = contentTypeForPath(relative_path),
             .cache = cachePolicyForPath(relative_path),
             .owned = true,
@@ -128,7 +148,11 @@ pub fn findEmbedded(path: []const u8) ?Asset {
     };
 
     for (assets) |asset| {
-        if (std.mem.eql(u8, asset.path, path)) return asset;
+        if (std.mem.eql(u8, asset.path, path)) {
+            var resolved = asset;
+            resolved.size = asset.body.len;
+            return resolved;
+        }
     }
     return null;
 }
@@ -171,6 +195,20 @@ fn contentTypeForPath(path: []const u8) []const u8 {
 fn cachePolicyForPath(path: []const u8) http_config.CachePolicy {
     if (std.mem.endsWith(u8, path, ".html")) return .no_cache;
     return .static_asset;
+}
+
+test "metadata-only static resolution preserves size without a body allocation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "asset.txt", .data = "metadata" });
+    var path_buffer: [128]u8 = undefined;
+    const directory = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const store = Store.filesystem(std.testing.io, std.testing.allocator, directory);
+    const asset = (try store.resolve("/asset.txt", true)).?;
+    defer asset.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), asset.body.len);
+    try std.testing.expectEqual(@as(usize, 8), asset.size);
+    try std.testing.expect(!asset.owned);
 }
 
 test "routeToRelativePath maps root and rejects unsafe paths" {

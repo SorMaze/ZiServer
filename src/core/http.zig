@@ -95,9 +95,11 @@ pub const ServeOptions = struct {
     tls_handshake_timeout_ms: u32 = 10_000,
     header_timeout_ms: u32 = 10_000,
     body_timeout_ms: u32 = 30_000,
+    write_timeout_ms: u32 = 30_000,
     keep_alive_timeout_ms: u32 = 15_000,
     stopping: ?*const std.atomic.Value(bool) = null,
     connection_registry: ?*transport.ConnectionRegistry = null,
+    dispatch_executor: ?*http2.DispatchExecutor = null,
     worker_index: usize = 0,
     access_log_enabled: bool = true,
     peer_ip: client_identity.IpKey = client_identity.IpKey.unspecified(),
@@ -177,6 +179,7 @@ fn handleConnection(
     serve_opts: ServeOptions,
 ) !void {
     var connection = transport.Connection.init(io, stream);
+    connection.setWriteTimeoutMs(serve_opts.write_timeout_ms);
     if (serve_opts.connection_registry) |registry| {
         registry.register(serve_opts.worker_index, &connection);
     }
@@ -259,6 +262,7 @@ fn handleConnection(
         };
         const summary = try http2.serve(
             &connection,
+            serve_opts.dispatch_executor orelse return error.Http2DispatchUnavailable,
             &h2_state,
             dispatchHttp2Request,
             serve_opts.keep_alive_requests,
@@ -400,20 +404,24 @@ fn handleConnection(
             );
             break :block streaming.Reader.pull(&live_source, http1_body_stream.Source.readerFn);
         } else null;
-        const action = try serveRequest(
-            &response_target,
-            io,
-            read_result.raw_request,
-            read_result.handler,
-            stats,
-            static_store,
-            app,
-            serve_opts.keep_alive_requests != 0,
-            close_due_to_limit,
-            "http/1.1",
-            per_request_opts,
-            body_reader,
-        );
+        const action = block: {
+            connection.beginWritePhase();
+            defer connection.endWritePhase();
+            break :block try serveRequest(
+                &response_target,
+                io,
+                read_result.raw_request,
+                read_result.handler,
+                stats,
+                static_store,
+                app,
+                serve_opts.keep_alive_requests != 0,
+                close_due_to_limit,
+                "http/1.1",
+                per_request_opts,
+                body_reader,
+            );
+        };
         handled += 1;
 
         const consumed_bytes = if (read_result.live_body) |plan| block: {
@@ -458,6 +466,7 @@ fn dispatchHttp2Request(
     body_reader: ?streaming.Reader,
     output_queue: *streaming.ByteQueue,
     headers_ready: *std.atomic.Value(bool),
+    capture_state: ?*response.H2CaptureState,
     response_wake: ?response.H2Wake,
     response_wake_userdata: ?*anyopaque,
 ) !void {
@@ -489,6 +498,7 @@ fn dispatchHttp2Request(
             .io = state.io,
             .output = output_queue,
             .headers_ready = headers_ready,
+            .capture_state = capture_state,
             .wake_userdata = response_wake_userdata,
             .wake = response_wake,
         } };
@@ -591,6 +601,7 @@ fn dispatchHttp2Request(
         .io = state.io,
         .output = output_queue,
         .headers_ready = headers_ready,
+        .capture_state = capture_state,
         .wake_userdata = response_wake_userdata,
         .wake = response_wake,
     } };
@@ -821,7 +832,7 @@ const Http2DrainTestHarness = struct {
         headers_ready: *std.atomic.Value(bool),
         failure: *?anyerror,
     ) void {
-        dispatchHttp2Request(state, request, captured, reader, output_queue, headers_ready, null, null) catch |err| {
+        dispatchHttp2Request(state, request, captured, reader, output_queue, headers_ready, null, null, null) catch |err| {
             failure.* = err;
         };
     }
@@ -1610,16 +1621,31 @@ fn serveRequest(
         },
         .static => |asset| {
             defer asset.deinit(static_store.allocator orelse std.heap.page_allocator);
-            try response.writeBytes(
-                writer,
-                .ok,
-                asset.content_type,
-                asset.body,
-                head,
-                keep_alive,
-                asset.cache,
-                transport_headers,
-            );
+            if (head) {
+                var stream = try response.Stream.begin(
+                    writer,
+                    .ok,
+                    asset.content_type,
+                    true,
+                    keep_alive,
+                    true,
+                    asset.size,
+                    asset.cache,
+                    transport_headers,
+                );
+                try stream.finish();
+            } else {
+                try response.writeBytes(
+                    writer,
+                    .ok,
+                    asset.content_type,
+                    asset.body,
+                    false,
+                    keep_alive,
+                    asset.cache,
+                    transport_headers,
+                );
+            }
             log_status = .ok;
             log_body_bytes = if (head) 0 else asset.body.len;
             log_cache.response_policy = asset.cache;

@@ -236,7 +236,11 @@ pub const Context = struct {
             .http1 => {},
             .h2_stream => |stream_target| {
                 stream_target.output.cancel(stream_target.io);
-                stream_target.response.deinit(stream_target.allocator);
+                if (stream_target.capture_state) |state| {
+                    state.abort(stream_target.io, stream_target.response, stream_target.allocator);
+                } else {
+                    stream_target.response.deinit(stream_target.allocator);
+                }
                 self.response_status = null;
                 self.response_body_bytes = 0;
                 self.response_written = false;

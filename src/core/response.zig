@@ -54,6 +54,7 @@ pub const Capture = extern struct {
     content_length: usize = 0,
     body_ptr: ?[*]u8 = null,
     body_len: usize = 0,
+    body_capacity: usize = 0,
     cache_ptr: ?[*]const u8 = null,
     cache_len: usize = 0,
     headers: [max_capture_headers]CapturedHeader = undefined,
@@ -62,7 +63,7 @@ pub const Capture = extern struct {
     content_length_known: u8 = 1,
 
     pub fn deinit(self: *Capture, allocator: std.mem.Allocator) void {
-        if (self.body_ptr) |body_ptr| allocator.free(body_ptr[0..self.body_len]);
+        if (self.body_ptr) |body_ptr| allocator.free(body_ptr[0..self.body_capacity]);
         if (self.content_type_ptr) |content_type_ptr| allocator.free(content_type_ptr[0..self.content_type_len]);
         if (self.cache_ptr) |cache_ptr| allocator.free(cache_ptr[0..self.cache_len]);
         var owned_header_start: usize = @min(captured_default_security_headers.len, self.headers_len);
@@ -80,6 +81,7 @@ pub const Capture = extern struct {
         }
         self.body_ptr = null;
         self.body_len = 0;
+        self.body_capacity = 0;
         self.content_type_ptr = null;
         self.content_type_len = 0;
         self.cache_ptr = null;
@@ -92,6 +94,55 @@ pub const Capture = extern struct {
 
 pub const H2Wake = *const fn (?*anyopaque) void;
 
+/// Coordinates ownership of a captured response between a handler and the
+/// HTTP/2 session thread. The session may claim it exactly once; a handler
+/// that aborts after publication must not free memory owned by the session.
+pub const H2CaptureState = struct {
+    mutex: std.Io.Mutex = .init,
+    claimed: bool = false,
+    aborted: bool = false,
+
+    pub fn claim(
+        self: *H2CaptureState,
+        io: std.Io,
+        source: *Capture,
+        destination: *Capture,
+    ) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.claimed or self.aborted) return false;
+        destination.* = source.*;
+        source.* = .{};
+        self.claimed = true;
+        return true;
+    }
+
+    pub fn abort(
+        self: *H2CaptureState,
+        io: std.Io,
+        capture: *Capture,
+        allocator: std.mem.Allocator,
+    ) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.claimed or self.aborted) return;
+        capture.deinit(allocator);
+        self.aborted = true;
+    }
+
+    pub fn release(
+        self: *H2CaptureState,
+        io: std.Io,
+        capture: *Capture,
+        allocator: std.mem.Allocator,
+    ) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        capture.deinit(allocator);
+        self.aborted = true;
+    }
+};
+
 pub const H2StreamTarget = struct {
     response: *Capture,
     allocator: std.mem.Allocator,
@@ -99,6 +150,7 @@ pub const H2StreamTarget = struct {
     io: std.Io,
     output: *streaming.ByteQueue,
     headers_ready: *std.atomic.Value(bool),
+    capture_state: ?*H2CaptureState = null,
     wake_userdata: ?*anyopaque = null,
     wake: ?H2Wake = null,
 };
@@ -225,7 +277,10 @@ pub const Stream = struct {
                 },
                 .h2_stream => switch (self.target.*) {
                     .h2_stream => |stream_target| {
-                        stream_target.response.content_length = self.declared_length orelse self.bytes_written;
+                        // The capture is published to the session thread when
+                        // headers become ready. Do not mutate its metadata
+                        // afterwards; unknown content lengths are intentionally
+                        // omitted from the HTTP/2 response.
                         stream_target.output.finish(stream_target.io);
                         signalH2Wake(stream_target);
                     },
@@ -370,6 +425,7 @@ fn captureBytes(
         const owned_body = try allocator.dupe(u8, body);
         capture.body_ptr = owned_body.ptr;
         capture.body_len = owned_body.len;
+        capture.body_capacity = owned_body.len;
     }
 }
 
@@ -470,13 +526,21 @@ fn writeStreamingHead(
 fn appendCapturedBody(capture: *Capture, allocator: std.mem.Allocator, chunk: []const u8) !void {
     if (chunk.len == 0) return;
     const next_len = std.math.add(usize, capture.body_len, chunk.len) catch return error.ResponseBodyTooLarge;
-    const body = if (capture.body_ptr) |ptr|
-        try allocator.realloc(ptr[0..capture.body_len], next_len)
-    else
-        try allocator.alloc(u8, next_len);
-    @memcpy(body[capture.body_len..next_len], chunk);
-    capture.body_ptr = body.ptr;
-    capture.body_len = body.len;
+    if (next_len > capture.body_capacity) {
+        const grown_capacity = if (capture.body_capacity == 0)
+            64
+        else
+            std.math.mul(usize, capture.body_capacity, 2) catch next_len;
+        const next_capacity = @max(next_len, grown_capacity);
+        const body = if (capture.body_ptr) |ptr|
+            try allocator.realloc(ptr[0..capture.body_capacity], next_capacity)
+        else
+            try allocator.alloc(u8, next_capacity);
+        capture.body_ptr = body.ptr;
+        capture.body_capacity = body.len;
+    }
+    @memcpy(capture.body_ptr.?[capture.body_len..next_len], chunk);
+    capture.body_len = next_len;
 }
 
 pub fn validateHeader(name: []const u8, value: []const u8) !void {
@@ -594,6 +658,30 @@ test "response stream appends chunks into HTTP2 capture target" {
     try stream.finish();
     try std.testing.expectEqualStrings("onetwo", capture.body_ptr.?[0..capture.body_len]);
     try std.testing.expectEqual(@as(usize, 6), capture.content_length);
+}
+
+test "HTTP2 capture ownership claims once and aborts before publication" {
+    var source = Capture{};
+    var target: Target = .{ .capture = .{
+        .response = &source,
+        .allocator = std.testing.allocator,
+        .secure = true,
+    } };
+    try writeBytes(&target, .ok, http_config.ContentType.plain, "owned", false, false, .no_cache, &.{});
+
+    var state = H2CaptureState{};
+    var claimed = Capture{};
+    try std.testing.expect(state.claim(std.testing.io, &source, &claimed));
+    try std.testing.expect(!state.claim(std.testing.io, &source, &claimed));
+    try std.testing.expectEqualStrings("owned", claimed.body_ptr.?[0..claimed.body_len]);
+    try std.testing.expectEqual(@as(usize, 0), source.body_len);
+    claimed.deinit(std.testing.allocator);
+    state.release(std.testing.io, &source, std.testing.allocator);
+
+    var aborted = Capture{};
+    var abort_state = H2CaptureState{};
+    abort_state.abort(std.testing.io, &aborted, std.testing.allocator);
+    try std.testing.expect(!abort_state.claim(std.testing.io, &aborted, &claimed));
 }
 
 test "HTTP2 buffered response spans bounded output queue" {

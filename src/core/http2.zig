@@ -78,7 +78,7 @@ pub const Summary = extern struct {
 };
 
 pub const DispatchFn = *const fn (?*anyopaque, *const Request, *response.Capture) anyerror!void;
-pub const StreamingDispatchFn = *const fn (?*anyopaque, *const Request, *response.Capture, ?streaming.Reader, *streaming.ByteQueue, *std.atomic.Value(bool), ?response.H2Wake, ?*anyopaque) anyerror!void;
+pub const StreamingDispatchFn = *const fn (?*anyopaque, *const Request, *response.Capture, ?streaming.Reader, *streaming.ByteQueue, *std.atomic.Value(bool), ?*response.H2CaptureState, ?response.H2Wake, ?*anyopaque) anyerror!void;
 
 const ReadFn = *const fn (*anyopaque, [*]u8, usize, c_int, c_int) callconv(.c) isize;
 const ReadReadyFn = *const fn (*anyopaque, u32) callconv(.c) c_int;
@@ -121,6 +121,7 @@ const ready_task_capacity = 128;
 
 const Bridge = struct {
     connection: *transport.Connection,
+    executor: *DispatchExecutor,
     userdata: ?*anyopaque,
     dispatch: StreamingDispatchFn,
     stream_timeout_ms: u32,
@@ -154,6 +155,7 @@ pub fn versionText() ?[:0]const u8 {
 
 pub fn serve(
     connection: *transport.Connection,
+    executor: *DispatchExecutor,
     userdata: ?*anyopaque,
     dispatch: StreamingDispatchFn,
     max_requests: usize,
@@ -164,6 +166,7 @@ pub fn serve(
     if (!linked) return error.Http2ProviderUnavailable;
     var bridge = Bridge{
         .connection = connection,
+        .executor = executor,
         .userdata = userdata,
         .dispatch = dispatch,
         .stream_timeout_ms = stream_timeout_ms,
@@ -258,6 +261,117 @@ fn shutdownBridge(userdata: *anyopaque) callconv(.c) c_int {
     return @intFromBool(stopping.load(.acquire));
 }
 
+pub const DispatchExecutor = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    threads: []std.Thread,
+    queue: []?*DispatchTask,
+    queue_head: usize = 0,
+    queue_len: usize = 0,
+    closing: bool = false,
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
+
+    pub fn create(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        worker_count: usize,
+        queue_capacity: usize,
+    ) !*DispatchExecutor {
+        if (worker_count == 0 or queue_capacity == 0) return error.InvalidDispatchExecutorConfig;
+        const self = try allocator.create(DispatchExecutor);
+        errdefer allocator.destroy(self);
+        const queue = try allocator.alloc(?*DispatchTask, queue_capacity);
+        errdefer allocator.free(queue);
+        const threads = try allocator.alloc(std.Thread, worker_count);
+        errdefer allocator.free(threads);
+        @memset(queue, null);
+        self.* = .{
+            .allocator = allocator,
+            .io = io,
+            .threads = threads,
+            .queue = queue,
+        };
+
+        var started: usize = 0;
+        errdefer {
+            self.mutex.lockUncancelable(io);
+            self.closing = true;
+            self.condition.broadcast(io);
+            self.mutex.unlock(io);
+            for (threads[0..started]) |thread| thread.join();
+        }
+        for (threads) |*thread| {
+            thread.* = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, dispatchWorker, .{self});
+            started += 1;
+        }
+        return self;
+    }
+
+    pub fn destroy(self: *DispatchExecutor) void {
+        const io = self.io;
+        self.mutex.lockUncancelable(io);
+        self.closing = true;
+        self.condition.broadcast(io);
+        self.mutex.unlock(io);
+        for (self.threads) |thread| thread.join();
+        std.debug.assert(self.queue_len == 0);
+        self.allocator.free(self.threads);
+        self.allocator.free(self.queue);
+        self.allocator.destroy(self);
+    }
+
+    fn submit(self: *DispatchExecutor, task: *DispatchTask) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.closing) return error.DispatchExecutorClosed;
+        if (self.queue_len == self.queue.len) return error.DispatchQueueFull;
+        const tail = (self.queue_head + self.queue_len) % self.queue.len;
+        self.queue[tail] = task;
+        self.queue_len += 1;
+        self.condition.signal(self.io);
+    }
+
+    fn removeQueued(self: *DispatchExecutor, task: *DispatchTask) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var found = false;
+        var kept: usize = 0;
+        var offset: usize = 0;
+        while (offset < self.queue_len) : (offset += 1) {
+            const index = (self.queue_head + offset) % self.queue.len;
+            const candidate = self.queue[index] orelse continue;
+            if (candidate == task) {
+                found = true;
+                continue;
+            }
+            self.queue[(self.queue_head + kept) % self.queue.len] = candidate;
+            kept += 1;
+        }
+        self.queue_len = kept;
+        return found;
+    }
+};
+
+fn dispatchWorker(executor: *DispatchExecutor) void {
+    while (true) {
+        executor.mutex.lockUncancelable(executor.io);
+        while (executor.queue_len == 0 and !executor.closing) {
+            executor.condition.waitUncancelable(executor.io, &executor.mutex);
+        }
+        if (executor.queue_len == 0 and executor.closing) {
+            executor.mutex.unlock(executor.io);
+            return;
+        }
+        const task = executor.queue[executor.queue_head].?;
+        executor.queue[executor.queue_head] = null;
+        executor.queue_head = (executor.queue_head + 1) % executor.queue.len;
+        executor.queue_len -= 1;
+        executor.mutex.unlock(executor.io);
+        runDispatchTask(task);
+    }
+}
+
 const OwnedRequest = struct {
     method: []u8,
     path: []u8,
@@ -339,15 +453,30 @@ const DispatchTask = struct {
     bridge: *Bridge,
     request: OwnedRequest,
     captured: response.Capture = .{},
+    capture_state: response.H2CaptureState = .{},
     done: std.atomic.Value(bool) = .init(false),
+    done_mutex: std.Io.Mutex = .init,
+    done_condition: std.Io.Condition = .init,
     headers_ready: std.atomic.Value(bool) = .init(false),
-    headers_claimed: bool = false,
-    future_awaited: bool = false,
     ready_enqueued: std.atomic.Value(bool) = .init(false),
     request_queue: streaming.ByteQueue,
     response_queue: streaming.ByteQueue,
     request_source: streaming.QueueSource,
-    future: std.Io.Future(void) = undefined,
+
+    fn finish(self: *DispatchTask) void {
+        const io = self.bridge.connection.io;
+        self.done_mutex.lockUncancelable(io);
+        self.done.store(true, .release);
+        self.done_condition.broadcast(io);
+        self.done_mutex.unlock(io);
+    }
+
+    fn waitDone(self: *DispatchTask) void {
+        const io = self.bridge.connection.io;
+        self.done_mutex.lockUncancelable(io);
+        while (!self.done.load(.acquire)) self.done_condition.waitUncancelable(io, &self.done_mutex);
+        self.done_mutex.unlock(io);
+    }
 };
 
 fn emptyReadyTasks() [ready_task_capacity]?*DispatchTask {
@@ -413,23 +542,30 @@ fn removeDispatchReady(task: *DispatchTask) void {
 fn runDispatchTask(task: *DispatchTask) void {
     var request = task.request.request();
     const reader = streaming.Reader.pull(&task.request_source, streaming.QueueSource.readerFn);
-    task.bridge.dispatch(task.bridge.userdata, &request, &task.captured, reader, &task.response_queue, &task.headers_ready, responseWakeBridge, task) catch |err| {
-        var target: response.Target = .{ .h2_stream = .{
-            .response = &task.captured,
-            .allocator = capture_allocator,
-            .secure = true,
-            .io = task.bridge.connection.io,
-            .output = &task.response_queue,
-            .headers_ready = &task.headers_ready,
-            .wake_userdata = task,
-            .wake = responseWakeBridge,
-        } };
-        _ = errors.write(&target, errors.kindFromError(err), false, false) catch {};
+    task.bridge.dispatch(task.bridge.userdata, &request, &task.captured, reader, &task.response_queue, &task.headers_ready, &task.capture_state, responseWakeBridge, task) catch |err| {
+        if (!task.headers_ready.load(.acquire)) {
+            var target: response.Target = .{ .h2_stream = .{
+                .response = &task.captured,
+                .allocator = capture_allocator,
+                .secure = true,
+                .io = task.bridge.connection.io,
+                .output = &task.response_queue,
+                .headers_ready = &task.headers_ready,
+                .capture_state = &task.capture_state,
+                .wake_userdata = task,
+                .wake = responseWakeBridge,
+            } };
+            _ = errors.write(&target, errors.kindFromError(err), false, false) catch {};
+        } else {
+            // Once headers are published the captured response belongs to the
+            // session thread. Do not overwrite it from the handler thread.
+            task.response_queue.cancel(task.bridge.connection.io);
+        }
     };
-    task.done.store(true, .release);
     // A published response is already represented by a ready task. Only
     // handlers that failed before publishing headers need a completion wake.
     if (!task.headers_ready.load(.acquire)) signalDispatchReady(task);
+    task.finish();
 }
 
 fn dispatchStartBridge(
@@ -443,7 +579,7 @@ fn dispatchStartBridge(
         capture_allocator.destroy(task);
         return -1;
     };
-    const response_queue = streaming.ByteQueue.init(capture_allocator, 64 * 1024) catch {
+    const response_queue = streaming.ByteQueue.init(capture_allocator, 16 * 1024) catch {
         var queue = request_queue;
         queue.deinit(bridge.connection.io);
         capture_allocator.destroy(task);
@@ -464,42 +600,42 @@ fn dispatchStartBridge(
         .request_source = undefined,
     };
     task.request_source = .{ .io = bridge.connection.io, .queue = &task.request_queue };
-    task.future = bridge.connection.io.concurrent(runDispatchTask, .{task}) catch {
+    bridge.executor.submit(task) catch |err| {
         task.request_queue.deinit(bridge.connection.io);
         task.response_queue.deinit(bridge.connection.io);
         task.request.deinit();
         capture_allocator.destroy(task);
-        return -1;
+        return switch (err) {
+            error.DispatchQueueFull, error.DispatchExecutorClosed => -2,
+        };
     };
     task_out.* = task;
     return 0;
 }
 
 fn dispatchPollBridge(userdata: *anyopaque, opaque_task: *anyopaque, captured_response: *response.Capture) callconv(.c) c_int {
-    const bridge: *Bridge = @ptrCast(@alignCast(userdata));
+    _ = userdata;
     const task: *DispatchTask = @ptrCast(@alignCast(opaque_task));
-    if (task.headers_ready.load(.acquire) and !task.headers_claimed) {
-        captured_response.* = task.captured;
-        task.captured = .{};
-        task.headers_claimed = true;
+    if (task.headers_ready.load(.acquire) and
+        task.capture_state.claim(task.bridge.connection.io, &task.captured, captured_response))
+    {
         return 2;
     }
     if (!task.done.load(.acquire)) return 0;
-    if (!task.future_awaited) {
-        task.future.await(bridge.connection.io);
-        task.future_awaited = true;
-    }
-    return if (task.headers_claimed) 3 else -1;
+    task.waitDone();
+    return if (task.capture_state.claimed) 3 else -1;
 }
 
 fn dispatchCancelBridge(userdata: *anyopaque, opaque_task: *anyopaque) callconv(.c) void {
     const bridge: *Bridge = @ptrCast(@alignCast(userdata));
     const task: *DispatchTask = @ptrCast(@alignCast(opaque_task));
+    if (!bridge.executor.removeQueued(task)) {
+        task.request_queue.cancel(bridge.connection.io);
+        task.response_queue.cancel(bridge.connection.io);
+        task.waitDone();
+    }
     removeDispatchReady(task);
-    task.request_queue.cancel(bridge.connection.io);
-    task.response_queue.cancel(bridge.connection.io);
-    if (!task.future_awaited) task.future.cancel(bridge.connection.io);
-    task.captured.deinit(capture_allocator);
+    task.capture_state.release(bridge.connection.io, &task.captured, capture_allocator);
     task.request_queue.deinit(bridge.connection.io);
     task.response_queue.deinit(bridge.connection.io);
     task.request.deinit();
@@ -509,9 +645,12 @@ fn dispatchCancelBridge(userdata: *anyopaque, opaque_task: *anyopaque) callconv(
 fn dispatchDataBridge(userdata: *anyopaque, opaque_task: *anyopaque, data: [*]const u8, len: usize, end_stream: c_int) callconv(.c) c_int {
     const bridge: *Bridge = @ptrCast(@alignCast(userdata));
     const task: *DispatchTask = @ptrCast(@alignCast(opaque_task));
-    if (len != 0) task.request_queue.push(bridge.connection.io, data[0..len]) catch |err| {
-        logger.message(bridge.connection.io, .warn, "http2_request_stream_push_failed", "error={t}", .{err});
-        return -1;
+    if (len != 0) task.request_queue.tryPush(bridge.connection.io, data[0..len]) catch |err| switch (err) {
+        error.StreamWouldBlock, error.StreamCanceled, error.StreamChunkTooLarge => return -2,
+        else => {
+            logger.message(bridge.connection.io, .warn, "http2_request_stream_push_failed", "error={t}", .{err});
+            return -1;
+        },
     };
     if (end_stream < 0) {
         task.request_queue.fail(bridge.connection.io, error.RequestBodyTooLarge);

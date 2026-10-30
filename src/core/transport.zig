@@ -3,6 +3,7 @@ const std = @import("std");
 const tls = @import("tls.zig");
 const logger = @import("log.zig");
 const socket_read = @import("socket_read.zig");
+const socket_write = @import("socket_write.zig");
 
 pub const net = std.Io.net;
 
@@ -27,6 +28,8 @@ pub const Connection = struct {
     tls_connection: ?tls.Connection = null,
     timeout_mutex: std.Io.Mutex = .init,
     read_deadline_ns: i96 = 0,
+    write_timeout_ms: u32 = 0,
+    write_deadline_ns: i96 = 0,
     tls_generation: std.atomic.Value(u64) = .init(0),
 
     pub fn init(io: std.Io, stream: Stream) Connection {
@@ -47,6 +50,7 @@ pub const Connection = struct {
             &lease,
             self.io,
             socketHandleValue(self.stream),
+            @intCast(read_deadline_ns),
             @intCast(read_deadline_ns),
         ) catch |err| {
             if (server_context.provider == .openssl) {
@@ -79,12 +83,14 @@ pub const Connection = struct {
         server_name: []const u8,
         advertise_h2: bool,
     ) !void {
+        const read_deadline_ns = self.readDeadlineNs();
         const tls_connection = try tls.initClientConnection(
             allocator,
             client_context,
             self.io,
             socketHandleValue(self.stream),
-            @intCast(self.readDeadlineNs()),
+            @intCast(read_deadline_ns),
+            @intCast(read_deadline_ns),
             server_name,
             advertise_h2,
         );
@@ -114,6 +120,11 @@ pub const Connection = struct {
 
     pub fn close(self: *Connection) void {
         if (self.tls_connection) |*tls_connection| {
+            // Do not let SSL_shutdown reuse the deadline of the last
+            // application write: that deadline may already be expired, and an
+            // unbounded close_notify can otherwise stall shutdown.
+            const close_deadline_ns = std.Io.Clock.awake.now(self.io).nanoseconds + std.time.ns_per_s;
+            tls.setWriteDeadline(tls_connection, @intCast(close_deadline_ns));
             tls_connection.deinit();
             self.tls_connection = null;
         }
@@ -134,6 +145,29 @@ pub const Connection = struct {
         if (self.tls_connection) |*tls_connection| {
             tls.setReadDeadline(tls_connection, @intCast(self.read_deadline_ns));
         }
+    }
+
+    pub fn setWriteTimeoutMs(self: *Connection, timeout_ms: u32) void {
+        self.timeout_mutex.lockUncancelable(self.io);
+        self.write_timeout_ms = timeout_ms;
+        self.timeout_mutex.unlock(self.io);
+    }
+
+    /// Starts one response write phase. All chunks of that response share the
+    /// same absolute deadline instead of getting a fresh budget per syscall.
+    pub fn beginWritePhase(self: *Connection) void {
+        self.timeout_mutex.lockUncancelable(self.io);
+        self.write_deadline_ns = if (self.write_timeout_ms == 0)
+            0
+        else
+            std.Io.Clock.awake.now(self.io).nanoseconds + @as(i96, self.write_timeout_ms) * std.time.ns_per_ms;
+        self.timeout_mutex.unlock(self.io);
+    }
+
+    pub fn endWritePhase(self: *Connection) void {
+        self.timeout_mutex.lockUncancelable(self.io);
+        self.write_deadline_ns = 0;
+        self.timeout_mutex.unlock(self.io);
     }
 
     pub fn writer(self: *Connection, buffer: []u8) Writer {
@@ -175,30 +209,39 @@ pub const Connection = struct {
     }
 
     fn write(self: *Connection, buffer: []const u8) !usize {
+        return self.writeWithDeadline(buffer, self.writeDeadlineNs());
+    }
+
+    fn writeWithDeadline(self: *Connection, buffer: []const u8, deadline_ns: i96) !usize {
         if (buffer.len == 0) return 0;
         if (self.tls_connection) |*tls_connection| {
+            tls.setWriteDeadline(tls_connection, @intCast(deadline_ns));
             return tls.write(tls_connection, buffer) catch |err| {
-                logTlsOperationError(self.io, "write");
+                if (err != error.GracefulShutdown and err != error.WriteTimeout) {
+                    logTlsOperationError(self.io, "write");
+                }
                 return err;
             };
         }
-        const handle = self.stream.socket.handle;
-        const result = self.io.operate(.{ .net_write = .{
-            .socket_handle = handle,
-            .header = &.{},
-            .data = &.{buffer},
-            .splat = 1,
-        } }) catch return error.WriteFailed;
-        return result.net_write catch error.WriteFailed;
+        return socket_write.write(self.io, self.stream.socket.handle, buffer, deadline_ns);
     }
 
     pub fn writeAll(self: *Connection, buffer: []const u8) !void {
+        const deadline_ns = self.writeDeadlineNs();
         var cursor: usize = 0;
         while (cursor < buffer.len) {
-            const n = try self.write(buffer[cursor..]);
+            const n = try self.writeWithDeadline(buffer[cursor..], deadline_ns);
             if (n == 0) return error.WriteFailed;
             cursor += n;
         }
+    }
+
+    fn writeDeadlineNs(self: *Connection) i96 {
+        self.timeout_mutex.lockUncancelable(self.io);
+        defer self.timeout_mutex.unlock(self.io);
+        if (self.write_deadline_ns != 0) return self.write_deadline_ns;
+        if (self.write_timeout_ms == 0) return 0;
+        return std.Io.Clock.awake.now(self.io).nanoseconds + @as(i96, self.write_timeout_ms) * std.time.ns_per_ms;
     }
 
     fn readDeadlineNs(self: *Connection) i96 {

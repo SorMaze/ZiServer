@@ -65,7 +65,8 @@ pub const QueueRead = union(enum) {
 
 pub const ByteQueue = struct {
     allocator: std.mem.Allocator,
-    buffer: []u8,
+    buffer: []u8 = &.{},
+    capacity: usize,
     read_index: usize = 0,
     write_index: usize = 0,
     size: usize = 0,
@@ -78,23 +79,24 @@ pub const ByteQueue = struct {
 
     pub fn init(allocator: std.mem.Allocator, capacity: usize) !ByteQueue {
         if (capacity == 0) return error.InvalidStreamCapacity;
-        return .{ .allocator = allocator, .buffer = try allocator.alloc(u8, capacity) };
+        return .{ .allocator = allocator, .capacity = capacity };
     }
 
     pub fn deinit(self: *ByteQueue, io: std.Io) void {
         self.cancel(io);
-        self.allocator.free(self.buffer);
+        if (self.buffer.len != 0) self.allocator.free(self.buffer);
         self.buffer = &.{};
     }
 
     pub fn maxChunkBytes(self: *const ByteQueue) usize {
-        return self.buffer.len;
+        return self.capacity;
     }
 
     pub fn push(self: *ByteQueue, io: std.Io, data: []const u8) !void {
-        if (data.len > self.buffer.len) return error.StreamChunkTooLarge;
+        if (data.len > self.capacity) return error.StreamChunkTooLarge;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        if (data.len != 0 and self.buffer.len == 0) self.buffer = try self.allocator.alloc(u8, self.capacity);
         var cursor: usize = 0;
         while (cursor < data.len) {
             while (self.size == self.buffer.len and !self.canceled) self.writable.waitUncancelable(io, &self.mutex);
@@ -108,6 +110,29 @@ pub const ByteQueue = struct {
             cursor += amount;
             self.readable.broadcast(io);
         }
+    }
+
+    /// Enqueues one chunk without waiting for the consumer. Protocol threads
+    /// must use this variant so a slow handler can never stall a session.
+    pub fn tryPush(self: *ByteQueue, io: std.Io, data: []const u8) !void {
+        if (data.len > self.capacity) return error.StreamChunkTooLarge;
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.canceled or self.ended) return error.StreamCanceled;
+        if (data.len == 0) return;
+        if (self.buffer.len == 0) self.buffer = try self.allocator.alloc(u8, self.capacity);
+        if (data.len > self.buffer.len - self.size) return error.StreamWouldBlock;
+
+        var cursor: usize = 0;
+        while (cursor < data.len) {
+            const contiguous = self.buffer.len - self.write_index;
+            const amount = @min(data.len - cursor, contiguous);
+            @memcpy(self.buffer[self.write_index .. self.write_index + amount], data[cursor .. cursor + amount]);
+            self.write_index = (self.write_index + amount) % self.buffer.len;
+            self.size += amount;
+            cursor += amount;
+        }
+        self.readable.broadcast(io);
     }
 
     pub fn readBlocking(self: *ByteQueue, io: std.Io, destination: []u8) !usize {
@@ -211,6 +236,28 @@ test "bounded byte queue preserves wraparound and end" {
     try std.testing.expectEqualStrings("cde", output[0..3]);
     queue.finish(std.testing.io);
     try std.testing.expectEqual(@as(usize, 0), try queue.readBlocking(std.testing.io, &output));
+}
+
+test "empty byte queue allocates only on first push" {
+    var queue = try ByteQueue.init(std.testing.allocator, 8);
+    defer queue.deinit(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 0), queue.buffer.len);
+    queue.finish(std.testing.io);
+    var output: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try queue.readBlocking(std.testing.io, &output));
+    try std.testing.expectEqual(@as(usize, 0), queue.buffer.len);
+}
+
+test "non-blocking push reports backpressure instead of waiting" {
+    var queue = try ByteQueue.init(std.testing.allocator, 4);
+    defer queue.deinit(std.testing.io);
+    try queue.tryPush(std.testing.io, "abcd");
+    try std.testing.expectError(error.StreamWouldBlock, queue.tryPush(std.testing.io, "e"));
+
+    var output: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try queue.readBlocking(std.testing.io, &output));
+    try queue.tryPush(std.testing.io, "e");
+    try std.testing.expectEqual(@as(usize, 4), queue.size);
 }
 
 test "bounded byte queue propagates producer failure" {

@@ -87,6 +87,7 @@ typedef struct {
     size_t content_length;
     uint8_t *body_ptr;
     size_t body_len;
+    size_t body_capacity;
     const uint8_t *cache_ptr;
     size_t cache_len;
     ziserver_h2_header headers[ZISERVER_H2_MAX_RESPONSE_HEADERS];
@@ -131,6 +132,7 @@ typedef struct ziserver_h2_stream {
     size_t body_capacity;
     uint8_t *response_body;
     size_t response_body_len;
+    size_t response_body_capacity;
     size_t response_body_offset;
     int responded;
     int streaming_response;
@@ -194,7 +196,7 @@ static void ziserver_h2_stream_free(ziserver_h2_stream *stream) {
         stream->body,
         stream->body_capacity,
         stream->response_body,
-        stream->response_body_len
+        stream->response_body_capacity
     );
     free(stream);
 }
@@ -389,9 +391,33 @@ static int ziserver_h2_on_data_chunk(
     }
     if (stream->dispatch_task != NULL) {
         stream->body_len += len;
-        return context->dispatch_data(context->userdata, stream->dispatch_task, data, len, 0) == 0
-            ? 0
-            : NGHTTP2_ERR_CALLBACK_FAILURE;
+        int data_result = context->dispatch_data(
+            context->userdata,
+            stream->dispatch_task,
+            data,
+            len,
+            0
+        );
+        if (data_result == 0) {
+            return 0;
+        }
+        if (data_result == -2) {
+            // The handler is not consuming its bounded request queue. Reject
+            // only this stream instead of blocking the nghttp2 session thread.
+            const int32_t failed_stream_id = stream_id;
+            context->dispatch_cancel(context->userdata, stream->dispatch_task);
+            stream->dispatch_task = NULL;
+            if (context->pending_dispatches != 0) {
+                context->pending_dispatches -= 1;
+            }
+            return nghttp2_submit_rst_stream(
+                session,
+                NGHTTP2_FLAG_NONE,
+                failed_stream_id,
+                NGHTTP2_ENHANCE_YOUR_CALM
+            );
+        }
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
     }
     int append_result = ziserver_h2_append_body_zig(
         &stream->body,
@@ -437,7 +463,15 @@ static ziserver_h2_ssize ziserver_h2_read_response(
             return 0;
         }
         if (result == -2) return NGHTTP2_ERR_DEFERRED;
-        return NGHTTP2_ERR_CALLBACK_FAILURE;
+        // A handler-side streaming failure must terminate this response, not
+        // the whole multiplexed session.
+        (void)nghttp2_submit_rst_stream(
+            session,
+            NGHTTP2_FLAG_NONE,
+            stream_id,
+            NGHTTP2_INTERNAL_ERROR
+        );
+        return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
     }
     size_t remaining = stream->response_body_len - stream->response_body_offset;
     size_t amount = remaining < length ? remaining : length;
@@ -508,14 +542,17 @@ static int ziserver_h2_submit_response(
         if (!response_released) {
             stream->response_body = response.body_ptr;
             stream->response_body_len = response.body_len;
+            stream->response_body_capacity = response.body_capacity;
             response.body_ptr = NULL;
             response.body_len = 0;
+            response.body_capacity = 0;
         } else {
             stream->response_body = ziserver_h2_copy_zig(response.body_ptr, response.body_len);
             if (stream->response_body == NULL) {
                 return NGHTTP2_ERR_NOMEM;
             }
             stream->response_body_len = response.body_len;
+            stream->response_body_capacity = response.body_len;
         }
     }
     stream->streaming_response = response.streaming != 0;
@@ -598,8 +635,20 @@ static int ziserver_h2_on_frame_recv(
             stream->request_error_status,
         };
         stream->dispatch_started = 1;
-        if (context->dispatch_start(context->userdata, &request, &stream->dispatch_task) != 0 ||
-            stream->dispatch_task == NULL) {
+        int start_result = context->dispatch_start(
+            context->userdata,
+            &request,
+            &stream->dispatch_task
+        );
+        if (start_result != 0 || stream->dispatch_task == NULL) {
+            if (start_result == -2) {
+                return nghttp2_submit_rst_stream(
+                    session,
+                    NGHTTP2_FLAG_NONE,
+                    frame->hd.stream_id,
+                    NGHTTP2_REFUSED_STREAM
+                );
+            }
             return NGHTTP2_ERR_CALLBACK_FAILURE;
         }
         context->pending_dispatches += 1;

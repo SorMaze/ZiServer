@@ -105,8 +105,10 @@ pub const Limiter = struct {
                 .entries = Map.init(allocator),
                 .capacity = capacity,
             };
-            try shard.entries.ensureTotalCapacity(@intCast(capacity));
             initialized += 1;
+            if (config.relaxed_rps != 0 or config.strict_rps != 0) {
+                try shard.entries.ensureTotalCapacity(@intCast(capacity));
+            }
         }
         return .{ .allocator = allocator, .config = config, .shards = shards };
     }
@@ -194,19 +196,12 @@ pub const Limiter = struct {
     }
 
     fn removeExpired(self: *Limiter, shard: *Shard, now_ms: i64) void {
-        while (true) {
-            var expired_key: ?Key = null;
-            var iterator = shard.entries.iterator();
-            while (iterator.next()) |item| {
-                if (now_ms < item.value_ptr.last_seen_ms or
-                    now_ms - item.value_ptr.last_seen_ms >= self.config.idle_ttl_ms)
-                {
-                    expired_key = item.key_ptr.*;
-                    break;
-                }
-            }
-            const key = expired_key orelse return;
-            if (shard.entries.remove(key)) {
+        var iterator = shard.entries.iterator();
+        while (iterator.next()) |item| {
+            if (now_ms < item.value_ptr.last_seen_ms or
+                now_ms - item.value_ptr.last_seen_ms >= self.config.idle_ttl_ms)
+            {
+                shard.entries.removeByPtr(item.key_ptr);
                 _ = self.entry_count.fetchSub(1, .monotonic);
                 _ = self.expired.fetchAdd(1, .monotonic);
             }
@@ -265,6 +260,7 @@ test "policy budgets are independent and disabled policies allocate nothing" {
     defer disabled.deinit(std.testing.io);
     try std.testing.expectEqual(Decision.allowed, try disabled.checkAt(std.testing.io, ip, .strict, 1));
     try std.testing.expectEqual(@as(usize, 0), disabled.snapshot().entries);
+    try std.testing.expectEqual(@as(u32, 0), disabled.shards[0].entries.capacity());
 }
 
 test "full limiter expires idle entries then fails closed" {
@@ -282,6 +278,28 @@ test "full limiter expires idle entries then fails closed" {
     try std.testing.expectEqual(Decision.allowed, try limiter.checkAt(std.testing.io, b, .strict, 2000));
     try std.testing.expectEqual(@as(usize, 1), limiter.snapshot().entries);
     try std.testing.expectEqual(@as(u64, 1), limiter.snapshot().expired);
+}
+
+test "full limiter removes every expired entry in one pass" {
+    const entry_total = 256;
+    var limiter = try Limiter.init(std.testing.allocator, .{
+        .strict_rps = 1,
+        .capacity = entry_total,
+        .shards = 1,
+        .idle_ttl_ms = 1000,
+    });
+    defer limiter.deinit(std.testing.io);
+    var ip = client_identity.IpKey{ .family = .ip4, .bytes = @splat(0) };
+    ip.bytes[0..4].* = .{ 192, 0, 2, 0 };
+    for (0..entry_total) |index| {
+        ip.bytes[3] = @intCast(index);
+        try std.testing.expectEqual(Decision.allowed, try limiter.checkAt(std.testing.io, ip, .strict, 1000));
+    }
+    ip.bytes[2] = 1;
+    try std.testing.expectEqual(Decision.allowed, try limiter.checkAt(std.testing.io, ip, .strict, 2000));
+    const snapshot = limiter.snapshot();
+    try std.testing.expectEqual(@as(usize, 1), snapshot.entries);
+    try std.testing.expectEqual(@as(u64, entry_total), snapshot.expired);
 }
 
 test "concurrent requests cannot exceed one IP budget" {

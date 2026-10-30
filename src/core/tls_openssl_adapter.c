@@ -33,7 +33,8 @@ typedef int (*ziserver_io_write_fn)(
     const void *vtable,
     uintptr_t socket_handle,
     const unsigned char *buffer,
-    int len
+    int len,
+    int64_t write_deadline_ns
 );
 
 typedef struct {
@@ -43,6 +44,7 @@ typedef struct {
     ziserver_io_read_fn read;
     ziserver_io_write_fn write;
     int64_t read_deadline_ns;
+    int64_t write_deadline_ns;
 } ziserver_bio_state;
 
 static void ziserver_openssl_reset_error(void) {
@@ -111,10 +113,13 @@ static int ziserver_socket_bio_write(BIO *bio, const char *buffer, int len) {
         state->vtable,
         state->socket_handle,
         (const unsigned char *)buffer,
-        len
+        len,
+        state->write_deadline_ns
     );
     ziserver_last_io_error = result < 0 ? result : 0;
-    return result;
+    // The BIO interface reports fatal I/O as -1; the typed reason remains in
+    // ziserver_last_io_error so the Zig wrapper can classify the failure.
+    return result < 0 ? -1 : result;
 }
 
 static long ziserver_socket_bio_ctrl(BIO *bio, int cmd, long num, void *ptr) {
@@ -157,6 +162,7 @@ static BIO *ziserver_socket_bio_new(
     const void *vtable,
     uintptr_t socket_handle,
     int64_t read_deadline_ns,
+    int64_t write_deadline_ns,
     ziserver_io_read_fn read_fn,
     ziserver_io_write_fn write_fn
 ) {
@@ -179,6 +185,7 @@ static BIO *ziserver_socket_bio_new(
     state->read = read_fn;
     state->write = write_fn;
     state->read_deadline_ns = read_deadline_ns;
+    state->write_deadline_ns = write_deadline_ns;
     BIO_set_data(bio, state);
     BIO_set_init(bio, 1);
     return bio;
@@ -618,6 +625,7 @@ SSL *ziserver_openssl_server_conn_new(
     const void *vtable,
     uintptr_t socket_handle,
     int64_t read_deadline_ns,
+    int64_t write_deadline_ns,
     ziserver_io_read_fn read_fn,
     ziserver_io_write_fn write_fn
 ) {
@@ -632,6 +640,7 @@ SSL *ziserver_openssl_server_conn_new(
         vtable,
         socket_handle,
         read_deadline_ns,
+        write_deadline_ns,
         read_fn,
         write_fn
     );
@@ -658,6 +667,7 @@ SSL *ziserver_openssl_client_conn_new(
     const void *vtable,
     uintptr_t socket_handle,
     int64_t read_deadline_ns,
+    int64_t write_deadline_ns,
     ziserver_io_read_fn read_fn,
     ziserver_io_write_fn write_fn,
     const char *server_name,
@@ -702,6 +712,7 @@ SSL *ziserver_openssl_client_conn_new(
         vtable,
         socket_handle,
         read_deadline_ns,
+        write_deadline_ns,
         read_fn,
         write_fn
     );
@@ -729,6 +740,17 @@ void ziserver_openssl_conn_set_read_deadline(SSL *ssl, int64_t deadline_ns) {
     ziserver_bio_state *state = bio == NULL ? NULL : (ziserver_bio_state *)BIO_get_data(bio);
     if (state != NULL) {
         state->read_deadline_ns = deadline_ns;
+    }
+}
+
+void ziserver_openssl_conn_set_write_deadline(SSL *ssl, int64_t deadline_ns) {
+    if (ssl == NULL) {
+        return;
+    }
+    BIO *bio = SSL_get_wbio(ssl);
+    ziserver_bio_state *state = bio == NULL ? NULL : (ziserver_bio_state *)BIO_get_data(bio);
+    if (state != NULL) {
+        state->write_deadline_ns = deadline_ns;
     }
 }
 

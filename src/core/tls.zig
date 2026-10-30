@@ -126,12 +126,13 @@ pub fn initConnection(
     io: std.Io,
     socket_handle: usize,
     read_deadline_ns: i64,
+    write_deadline_ns: i64,
 ) !Connection {
     const server_handle = server_context.handle orelse return error.TlsProviderUnavailable;
     switch (server_context.provider) {
         .openssl => return .{
             .provider = .openssl,
-            .handle = try openssl_backend.initConnectionHandle(server_handle, io, socket_handle, read_deadline_ns),
+            .handle = try openssl_backend.initConnectionHandle(server_handle, io, socket_handle, read_deadline_ns, write_deadline_ns),
         },
         .schannel => return .{
             .provider = .schannel,
@@ -147,6 +148,7 @@ pub fn initClientConnection(
     io: std.Io,
     socket_handle: usize,
     read_deadline_ns: i64,
+    write_deadline_ns: i64,
     server_name: []const u8,
     advertise_h2: bool,
 ) !Connection {
@@ -160,6 +162,7 @@ pub fn initClientConnection(
                 io,
                 socket_handle,
                 read_deadline_ns,
+                write_deadline_ns,
                 server_name,
                 advertise_h2,
             ),
@@ -172,6 +175,14 @@ pub fn setReadDeadline(connection: *Connection, deadline_ns: i64) void {
     const handle = connection.handle orelse return;
     switch (connection.provider) {
         .openssl => openssl_backend.setReadDeadline(handle, deadline_ns),
+        .schannel, .none => {},
+    }
+}
+
+pub fn setWriteDeadline(connection: *Connection, deadline_ns: i64) void {
+    const handle = connection.handle orelse return;
+    switch (connection.provider) {
+        .openssl => openssl_backend.setWriteDeadline(handle, deadline_ns),
         .schannel, .none => {},
     }
 }

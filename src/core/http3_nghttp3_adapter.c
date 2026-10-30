@@ -47,6 +47,7 @@ typedef struct {
     size_t content_length;
     uint8_t *body_ptr;
     size_t body_len;
+    size_t body_capacity;
     const uint8_t *cache_ptr;
     size_t cache_len;
     ziserver_header headers[ZISERVER_CAPTURE_HEADERS];
@@ -449,6 +450,7 @@ static void fallback_capture(h3_stream_state *stream, uint16_t status,
     stream->capture.body_len = strlen(body);
     stream->capture.content_length = stream->capture.body_len;
     stream->capture.body_ptr = dup_bytes((const uint8_t *)body, stream->capture.body_len);
+    stream->capture.body_capacity = stream->capture.body_ptr ? stream->capture.body_len : 0;
     if (!stream->capture.body_ptr) {
         stream->capture.body_len = 0;
         stream->capture.content_length = 0;

@@ -1,5 +1,6 @@
 const std = @import("std");
 const socket_read = @import("../socket_read.zig");
+const socket_write = @import("../socket_write.zig");
 const build_options = @import("build_options");
 const http_config = @import("../http_config.zig");
 
@@ -21,7 +22,7 @@ extern fn ziserver_openssl_client_ctx_new(verify_peer: c_int) ?*anyopaque;
 extern fn ziserver_openssl_client_ctx_free(ctx: ?*anyopaque) void;
 extern fn ziserver_openssl_last_error() c_ulong;
 const IoReadFn = *const fn (?*anyopaque, *const anyopaque, usize, [*]u8, c_int, i64) callconv(.c) c_int;
-const IoWriteFn = *const fn (?*anyopaque, *const anyopaque, usize, [*]const u8, c_int) callconv(.c) c_int;
+const IoWriteFn = *const fn (?*anyopaque, *const anyopaque, usize, [*]const u8, c_int, i64) callconv(.c) c_int;
 
 extern fn ziserver_openssl_server_conn_new(
     ctx: *anyopaque,
@@ -29,6 +30,7 @@ extern fn ziserver_openssl_server_conn_new(
     vtable: *const anyopaque,
     socket_handle: usize,
     read_deadline_ns: i64,
+    write_deadline_ns: i64,
     read_fn: IoReadFn,
     write_fn: IoWriteFn,
 ) ?*anyopaque;
@@ -39,6 +41,7 @@ extern fn ziserver_openssl_client_conn_new(
     vtable: *const anyopaque,
     socket_handle: usize,
     read_deadline_ns: i64,
+    write_deadline_ns: i64,
     read_fn: IoReadFn,
     write_fn: IoWriteFn,
     server_name: [*:0]const u8,
@@ -52,6 +55,7 @@ extern fn ziserver_openssl_last_io_error() c_int;
 extern fn ziserver_openssl_last_error_text() [*:0]const u8;
 extern fn ziserver_openssl_conn_alpn(conn: *anyopaque) c_int;
 extern fn ziserver_openssl_conn_set_read_deadline(conn: *anyopaque, deadline_ns: i64) void;
+extern fn ziserver_openssl_conn_set_write_deadline(conn: *anyopaque, deadline_ns: i64) void;
 extern fn ziserver_openssl_conn_version(conn: *anyopaque) [*:0]const u8;
 extern fn ziserver_openssl_conn_cipher(conn: *anyopaque) [*:0]const u8;
 extern fn ziserver_openssl_conn_session_reused(conn: *anyopaque) c_int;
@@ -174,6 +178,7 @@ pub fn initConnectionHandle(
     io: std.Io,
     socket_handle: usize,
     read_deadline_ns: i64,
+    write_deadline_ns: i64,
 ) !*anyopaque {
     if (!linked) return error.TlsProviderUnavailable;
     return ziserver_openssl_server_conn_new(
@@ -182,6 +187,7 @@ pub fn initConnectionHandle(
         @ptrCast(io.vtable),
         socket_handle,
         read_deadline_ns,
+        write_deadline_ns,
         tlsIoRead,
         tlsIoWrite,
     ) orelse if (lastIoError() == -2) error.TlsHandshakeTimeout else error.TlsHandshakeFailed;
@@ -193,6 +199,7 @@ pub fn initClientConnectionHandle(
     io: std.Io,
     socket_handle: usize,
     read_deadline_ns: i64,
+    write_deadline_ns: i64,
     server_name: []const u8,
     advertise_h2: bool,
 ) !*anyopaque {
@@ -206,6 +213,7 @@ pub fn initClientConnectionHandle(
         @ptrCast(io.vtable),
         socket_handle,
         read_deadline_ns,
+        write_deadline_ns,
         tlsIoRead,
         tlsIoWrite,
         server_name_z.ptr,
@@ -225,6 +233,7 @@ pub fn read(handle: *anyopaque, buffer: []u8) !usize {
     const n = ziserver_openssl_conn_read(handle, buffer.ptr, len);
     if (n < 0) return switch (lastIoError() orelse 0) {
         -2 => error.ReadTimeout,
+        -3 => error.Canceled,
         -4 => error.GracefulShutdown,
         else => error.TlsReadFailed,
     };
@@ -239,13 +248,22 @@ pub fn setReadDeadline(handle: *anyopaque, deadline_ns: i64) void {
     if (linked) ziserver_openssl_conn_set_read_deadline(handle, deadline_ns);
 }
 
+pub fn setWriteDeadline(handle: *anyopaque, deadline_ns: i64) void {
+    if (linked) ziserver_openssl_conn_set_write_deadline(handle, deadline_ns);
+}
+
 pub fn write(handle: *anyopaque, buffer: []const u8) !usize {
     if (!linked) return error.TlsProviderUnavailable;
     if (buffer.len == 0) return 0;
     const max_len: usize = @intCast(std.math.maxInt(c_int));
     const len: c_int = @intCast(@min(buffer.len, max_len));
     const n = ziserver_openssl_conn_write(handle, buffer.ptr, len);
-    if (n <= 0) return error.TlsWriteFailed;
+    if (n <= 0) return switch (lastIoError() orelse 0) {
+        -2 => error.WriteTimeout,
+        -3 => error.Canceled,
+        -4 => error.GracefulShutdown,
+        else => error.TlsWriteFailed,
+    };
     return @intCast(n);
 }
 
@@ -307,17 +325,21 @@ fn tlsIoWrite(
     socket_handle: usize,
     buffer: [*]const u8,
     len: c_int,
+    write_deadline_ns: i64,
 ) callconv(.c) c_int {
     if (len <= 0) return 0;
     const io = ioFromParts(userdata, vtable_ptr);
-    const bytes = buffer[0..@intCast(len)];
-    const result = io.operate(.{ .net_write = .{
-        .socket_handle = handleFromValue(socket_handle),
-        .header = &.{},
-        .data = &.{bytes},
-        .splat = 1,
-    } }) catch return -1;
-    const written = result.net_write catch return -1;
+    const written = socket_write.write(
+        io,
+        handleFromValue(socket_handle),
+        buffer[0..@intCast(len)],
+        write_deadline_ns,
+    ) catch |err| switch (err) {
+        error.WriteTimeout => return -2,
+        error.Canceled => return -3,
+        error.GracefulShutdown => return -4,
+        else => return -1,
+    };
     return @intCast(written);
 }
 
