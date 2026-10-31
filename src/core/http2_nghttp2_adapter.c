@@ -111,6 +111,7 @@ typedef void (*ziserver_h2_dispatch_cancel_fn)(void *userdata, void *task);
 typedef void *(*ziserver_h2_dispatch_take_ready_fn)(void *userdata);
 typedef void (*ziserver_h2_release_fn)(void *userdata, ziserver_h2_response *response);
 typedef int (*ziserver_h2_dispatch_data_fn)(void *userdata, void *task, const uint8_t *data, size_t len, int end_stream);
+typedef size_t (*ziserver_h2_dispatch_consumed_fn)(void *userdata, void *task);
 typedef intptr_t (*ziserver_h2_response_read_fn)(void *userdata, void *task, uint8_t *buffer, size_t len, int *end_out);
 typedef int (*ziserver_h2_response_ready_fn)(void *userdata, void *task);
 
@@ -167,6 +168,7 @@ struct ziserver_h2_session {
     ziserver_h2_dispatch_take_ready_fn dispatch_take_ready;
     ziserver_h2_release_fn release;
     ziserver_h2_dispatch_data_fn dispatch_data;
+    ziserver_h2_dispatch_consumed_fn dispatch_consumed;
     ziserver_h2_response_read_fn response_read;
     ziserver_h2_response_ready_fn response_ready;
     size_t max_header_bytes;
@@ -370,12 +372,17 @@ static int ziserver_h2_on_data_chunk(
 ) {
     (void)flags;
     ziserver_h2_session *context = user_data;
+    // Return connection credit immediately: one unread stream must not
+    // exhaust the shared connection window. Stream credit follows consumption.
+    int consume_result = nghttp2_session_consume_connection(session, len);
+    if (consume_result != 0) return consume_result;
     ziserver_h2_stream *stream = nghttp2_session_get_stream_user_data(session, stream_id);
     if (stream == NULL) {
         return 0;
     }
     if (stream->request_error_status != 0) {
-        return 0;
+        // Rejected requests are drained without entering the handler queue.
+        return nghttp2_session_consume_stream(session, stream_id, len);
     }
     if (len > context->max_body_bytes || stream->body_len > context->max_body_bytes - len) {
         stream->request_error_status = 413;
@@ -739,6 +746,18 @@ static int ziserver_h2_poll_all_dispatches(
     return 0;
 }
 
+static int ziserver_h2_update_windows(nghttp2_session *session, ziserver_h2_session *context) {
+    for (ziserver_h2_stream *stream = context->streams; stream != NULL; stream = stream->next) {
+        if (stream->dispatch_task == NULL) continue;
+        size_t consumed = context->dispatch_consumed(context->userdata, stream->dispatch_task);
+        if (consumed != 0) {
+            int result = nghttp2_session_consume_stream(session, stream->stream_id, consumed);
+            if (result != 0) return result;
+        }
+    }
+    return 0;
+}
+
 static int ziserver_h2_on_stream_close(
     nghttp2_session *session,
     int32_t stream_id,
@@ -782,6 +801,7 @@ int ziserver_nghttp2_serve(
     ziserver_h2_dispatch_take_ready_fn dispatch_take_ready_fn,
     ziserver_h2_release_fn release_fn,
     ziserver_h2_dispatch_data_fn dispatch_data_fn,
+    ziserver_h2_dispatch_consumed_fn dispatch_consumed_fn,
     ziserver_h2_response_read_fn response_read_fn,
     ziserver_h2_response_ready_fn response_ready_fn,
     size_t max_header_bytes,
@@ -802,6 +822,7 @@ int ziserver_nghttp2_serve(
         .dispatch_take_ready = dispatch_take_ready_fn,
         .release = release_fn,
         .dispatch_data = dispatch_data_fn,
+        .dispatch_consumed = dispatch_consumed_fn,
         .response_read = response_read_fn,
         .response_ready = response_ready_fn,
         .max_header_bytes = max_header_bytes,
@@ -822,17 +843,23 @@ int ziserver_nghttp2_serve(
     nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, ziserver_h2_on_frame_recv);
     nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, ziserver_h2_on_stream_close);
 
-    result = nghttp2_session_server_new(&session, callbacks, &context);
+    nghttp2_option *option = NULL;
+    result = nghttp2_option_new(&option);
+    if (result != 0) {
+        nghttp2_session_callbacks_del(callbacks);
+        return result;
+    }
+    nghttp2_option_set_no_auto_window_update(option, 1);
+    result = nghttp2_session_server_new2(&session, callbacks, &context, option);
+    nghttp2_option_del(option);
     nghttp2_session_callbacks_del(callbacks);
     if (result != 0) {
         return result;
     }
 
-    uint64_t receive_window_wide = (uint64_t)max_body_bytes + 16384u;
-    if (receive_window_wide > 262144u) receive_window_wide = 262144u;
-    uint32_t receive_window = receive_window_wide > 0x7fffffffu
-        ? 0x7fffffffu
-        : (uint32_t)receive_window_wide;
+    // Match the RFC default window so DATA sent before the peer receives our
+    // SETTINGS also fits the bounded 64 KiB Zig request queue.
+    uint32_t receive_window = 65535;
     nghttp2_settings_entry settings[] = {
         {NGHTTP2_SETTINGS_HEADER_TABLE_SIZE, 4096},
         {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, ZISERVER_H2_MAX_CONCURRENT_STREAMS},
@@ -857,7 +884,8 @@ int ziserver_nghttp2_serve(
             : context.max_requests + ZISERVER_H2_MAX_CONCURRENT_STREAMS);
     size_t response_poll_spins = 0;
     while (result == 0 && (nghttp2_session_want_read(session) || nghttp2_session_want_write(session))) {
-        result = ziserver_h2_poll_ready_dispatches(session, &context);
+        result = ziserver_h2_update_windows(session, &context);
+        if (result == 0) result = ziserver_h2_poll_ready_dispatches(session, &context);
         if (result == 0) result = nghttp2_session_send(session);
         if (result == 0 && !context.goaway_sent &&
             context.request_count >= goaway_request_limit &&

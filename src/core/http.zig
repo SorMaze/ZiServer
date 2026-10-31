@@ -99,7 +99,6 @@ pub const ServeOptions = struct {
     keep_alive_timeout_ms: u32 = 15_000,
     stopping: ?*const std.atomic.Value(bool) = null,
     connection_registry: ?*transport.ConnectionRegistry = null,
-    dispatch_executor: ?*http2.DispatchExecutor = null,
     worker_index: usize = 0,
     access_log_enabled: bool = true,
     peer_ip: client_identity.IpKey = client_identity.IpKey.unspecified(),
@@ -262,7 +261,6 @@ fn handleConnection(
         };
         const summary = try http2.serve(
             &connection,
-            serve_opts.dispatch_executor orelse return error.Http2DispatchUnavailable,
             &h2_state,
             dispatchHttp2Request,
             serve_opts.keep_alive_requests,

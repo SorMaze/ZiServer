@@ -414,9 +414,9 @@ JSON 字段包含 `time_unix_ms`、`level`、`event`、`protocol`、`method`、`
 - 明文 HTTP/2 h2c preface 或 `HTTP/2.0` 请求行会返回 `505 HTTP Version Not Supported`，不会再被误归类为普通 `400`。
 - 明文端口收到 TLS ClientHello 时会快速关闭并记录 `method=TLS` 的访问日志；TLS 客户端无法读取明文错误响应，因此这里不写 HTTP body。
 - `--http2=on` 只在 TLS termination 和 nghttp2 provider 同时可用时启动；服务端通过 ALPN 优先协商 `h2`，不支持 h2 的客户端继续回退到 HTTP/1.1。
-- h2 SETTINGS 明确发布 4 KiB HPACK table、128 个并发 stream、最大 256 KiB 单 stream 初始接收窗口和 4 KiB header-list 上限；正文仍经 16 KiB request queue 反压，不按窗口大小预分配。
+- h2 SETTINGS 明确发布 4 KiB HPACK table、128 个并发 stream、65,535 字节的单 stream 初始接收窗口和 4 KiB header-list 上限；正文通过按需分配的 64 KiB request queue。handler 消费正文后才补充 stream 窗口，connection 窗口独立补充，避免慢 stream 阻塞其他请求。
 - h2 请求会深拷贝后提交到 Zig 并发执行器，并映射到现有 router、middleware、body limit、handler 和结构化日志；nghttp2 session 提交与 socket 写保持单线程，动态页面、静态资源、HEAD、JSON POST、错误响应和并发 stream 共用同一业务管线。
-- h2 在 HEADERS 后提前生成协议纠正 `308` 等终止响应时，dispatch 仍会后台排空该 stream 的 DATA 直到 END_STREAM；因此超过 16 KiB request queue 的 POST 不会阻塞 nghttp2 session 或同连接上的其他 stream。
+- h2 在 HEADERS 后提前生成协议纠正 `308` 等终止响应时，dispatch 仍会后台排空该 stream 的 DATA 直到 END_STREAM；因此超过 64 KiB request queue 的 POST 也会通过流控持续传输，不阻塞 nghttp2 session 或同连接上的其他 stream。
 - h2 的 header/body 超限只终止当前请求并返回 `431`/`413`，不会拖垮同一连接上的其他 stream。缺失或重复必要伪头会返回 `400`。
 - `--keep-alive=N` 同样限制单个 h2 session 完成的请求数；达到上限后发送 `NO_ERROR` GOAWAY，等待已接收 stream 排空。session 结束时输出 `http2_session_closed` JSON Lines 事件，包含请求数、最高 stream id 和 GOAWAY 状态。
 - 收到进程停机信号时，阻塞读取会在内部 50 ms 检查周期内被取消，h2 session 随即发送 `NO_ERROR` GOAWAY；该检查周期不改变用户配置的请求或 keep-alive 绝对超时。

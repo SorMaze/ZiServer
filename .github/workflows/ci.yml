@@ -128,6 +128,18 @@ jobs:
             --server="$server" \
             --log-file="$RUNNER_TEMP/ziserver-smoke/server.log"
 
+      - name: HTTP2 flow control and cancellation regressions
+        if: matrix.tls_args == ''
+        shell: bash
+        run: |
+          server=zig-out/bin/ziserver
+          if [ "$RUNNER_OS" = Windows ]; then server=$server.exe; fi
+          node scripts/http2-regression-test.mjs \
+            --server="$server" \
+            --tls-cert="$RUNNER_TEMP/ziserver-smoke/cert.pem" \
+            --tls-key="$RUNNER_TEMP/ziserver-smoke/key.pem" \
+            --log-file="$RUNNER_TEMP/ziserver-smoke/http2-regressions.log"
+
       - name: TLS certificate lifecycle regressions
         if: matrix.tls_args == ''
         shell: bash

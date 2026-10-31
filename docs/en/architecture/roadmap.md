@@ -13,8 +13,8 @@ This list is based on the current source, build options, tests, and public docum
    - Fill leader/waiter handling, failure release, fixed-capacity degradation, bounded cancellable/configurable waiting, and the `/stats` `fill_wait_timeouts` metric are implemented.
    - The default wait is 100 ms; after timeout a request renders independently. Only stale-while-revalidate evaluation remains.
 2. **True in-connection concurrent HTTP/2 dispatch (complete)**
-   - Completed streams are deep-copied and submitted to concurrent Zig `std.Io` tasks. RST/session closure safely cancels and reclaims tasks.
-   - The nghttp2 session thread only polls completions, submits responses, and writes sockets; handlers never invoke nghttp2 concurrently. `zibench` supports `--streams-per-connection=1..128`.
+   - Requests are deep-copied after HEADERS and submitted to cancellable Zig `std.Io` concurrent tasks, bounded by 128 streams per connection. Waiting for bodies does not exhaust a fixed global dispatch pool. RST/session closure cancels and reclaims tasks.
+   - The nghttp2 session thread polls completions, submits responses, replenishes windows, and writes sockets; handlers never invoke nghttp2 concurrently. The bounded 64 KiB request queue replenishes stream credit only after consumption, independently of connection credit. Normal backpressure pauses the sender rather than resetting the stream. `zibench` supports `--streams-per-connection=1..128`.
 3. **Bidirectional streaming (complete)**
    - Strict chunked framing, extensions/trailers, CL/TE ambiguity prevention, `Expect: 100-continue`/417, and a unified absolute body deadline are supported.
    - A unified request Reader and response begin/write/finish API are available. HTTP/1.1 reads the socket/chunk decoder immediately after header routing and flushes chunked output in real time.

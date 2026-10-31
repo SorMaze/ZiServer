@@ -91,6 +91,7 @@ const DispatchCancelFn = *const fn (*anyopaque, *anyopaque) callconv(.c) void;
 const DispatchTakeReadyFn = *const fn (*anyopaque) callconv(.c) ?*anyopaque;
 const ReleaseFn = *const fn (*anyopaque, *response.Capture) callconv(.c) void;
 const DispatchDataFn = *const fn (*anyopaque, *anyopaque, [*]const u8, usize, c_int) callconv(.c) c_int;
+const DispatchConsumedFn = *const fn (*anyopaque, *anyopaque) callconv(.c) usize;
 const ResponseReadFn = *const fn (*anyopaque, *anyopaque, [*]u8, usize, *c_int) callconv(.c) isize;
 const ResponseReadyFn = *const fn (*anyopaque, *anyopaque) callconv(.c) c_int;
 
@@ -109,6 +110,7 @@ extern fn ziserver_nghttp2_serve(
     dispatch_take_ready_fn: DispatchTakeReadyFn,
     release_fn: ReleaseFn,
     dispatch_data_fn: DispatchDataFn,
+    dispatch_consumed_fn: DispatchConsumedFn,
     response_read_fn: ResponseReadFn,
     response_ready_fn: ResponseReadyFn,
     max_header_bytes: usize,
@@ -121,7 +123,6 @@ const ready_task_capacity = 128;
 
 const Bridge = struct {
     connection: *transport.Connection,
-    executor: *DispatchExecutor,
     userdata: ?*anyopaque,
     dispatch: StreamingDispatchFn,
     stream_timeout_ms: u32,
@@ -134,6 +135,8 @@ const Bridge = struct {
     ready_tasks: [ready_task_capacity]?*DispatchTask = emptyReadyTasks(),
     ready_head: usize = 0,
     ready_len: usize = 0,
+    live_tasks: std.atomic.Value(usize) = .init(0),
+    retiring: std.Io.Group = .init,
 };
 
 pub fn supportFromMode(mode: http_config.Http2Mode) Support {
@@ -155,7 +158,6 @@ pub fn versionText() ?[:0]const u8 {
 
 pub fn serve(
     connection: *transport.Connection,
-    executor: *DispatchExecutor,
     userdata: ?*anyopaque,
     dispatch: StreamingDispatchFn,
     max_requests: usize,
@@ -166,13 +168,15 @@ pub fn serve(
     if (!linked) return error.Http2ProviderUnavailable;
     var bridge = Bridge{
         .connection = connection,
-        .executor = executor,
         .userdata = userdata,
         .dispatch = dispatch,
         .stream_timeout_ms = stream_timeout_ms,
         .idle_timeout_ms = idle_timeout_ms,
         .stopping = stopping,
     };
+    // Retiring tasks can still reference the connection's dispatch state.
+    // Join them before returning and releasing that state.
+    defer bridge.retiring.cancel(connection.io);
     var summary = Summary{};
     const result = ziserver_nghttp2_serve(
         &bridge,
@@ -187,6 +191,7 @@ pub fn serve(
         dispatchTakeReadyBridge,
         releaseBridge,
         dispatchDataBridge,
+        dispatchConsumedBridge,
         responseReadBridge,
         responseReadyBridge,
         http_config.max_header_bytes,
@@ -259,117 +264,6 @@ fn shutdownBridge(userdata: *anyopaque) callconv(.c) c_int {
     const bridge: *Bridge = @ptrCast(@alignCast(userdata));
     const stopping = bridge.stopping orelse return 0;
     return @intFromBool(stopping.load(.acquire));
-}
-
-pub const DispatchExecutor = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    threads: []std.Thread,
-    queue: []?*DispatchTask,
-    queue_head: usize = 0,
-    queue_len: usize = 0,
-    closing: bool = false,
-    mutex: std.Io.Mutex = .init,
-    condition: std.Io.Condition = .init,
-
-    pub fn create(
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        worker_count: usize,
-        queue_capacity: usize,
-    ) !*DispatchExecutor {
-        if (worker_count == 0 or queue_capacity == 0) return error.InvalidDispatchExecutorConfig;
-        const self = try allocator.create(DispatchExecutor);
-        errdefer allocator.destroy(self);
-        const queue = try allocator.alloc(?*DispatchTask, queue_capacity);
-        errdefer allocator.free(queue);
-        const threads = try allocator.alloc(std.Thread, worker_count);
-        errdefer allocator.free(threads);
-        @memset(queue, null);
-        self.* = .{
-            .allocator = allocator,
-            .io = io,
-            .threads = threads,
-            .queue = queue,
-        };
-
-        var started: usize = 0;
-        errdefer {
-            self.mutex.lockUncancelable(io);
-            self.closing = true;
-            self.condition.broadcast(io);
-            self.mutex.unlock(io);
-            for (threads[0..started]) |thread| thread.join();
-        }
-        for (threads) |*thread| {
-            thread.* = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, dispatchWorker, .{self});
-            started += 1;
-        }
-        return self;
-    }
-
-    pub fn destroy(self: *DispatchExecutor) void {
-        const io = self.io;
-        self.mutex.lockUncancelable(io);
-        self.closing = true;
-        self.condition.broadcast(io);
-        self.mutex.unlock(io);
-        for (self.threads) |thread| thread.join();
-        std.debug.assert(self.queue_len == 0);
-        self.allocator.free(self.threads);
-        self.allocator.free(self.queue);
-        self.allocator.destroy(self);
-    }
-
-    fn submit(self: *DispatchExecutor, task: *DispatchTask) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (self.closing) return error.DispatchExecutorClosed;
-        if (self.queue_len == self.queue.len) return error.DispatchQueueFull;
-        const tail = (self.queue_head + self.queue_len) % self.queue.len;
-        self.queue[tail] = task;
-        self.queue_len += 1;
-        self.condition.signal(self.io);
-    }
-
-    fn removeQueued(self: *DispatchExecutor, task: *DispatchTask) bool {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        var found = false;
-        var kept: usize = 0;
-        var offset: usize = 0;
-        while (offset < self.queue_len) : (offset += 1) {
-            const index = (self.queue_head + offset) % self.queue.len;
-            const candidate = self.queue[index] orelse continue;
-            if (candidate == task) {
-                found = true;
-                continue;
-            }
-            self.queue[(self.queue_head + kept) % self.queue.len] = candidate;
-            kept += 1;
-        }
-        self.queue_len = kept;
-        return found;
-    }
-};
-
-fn dispatchWorker(executor: *DispatchExecutor) void {
-    while (true) {
-        executor.mutex.lockUncancelable(executor.io);
-        while (executor.queue_len == 0 and !executor.closing) {
-            executor.condition.waitUncancelable(executor.io, &executor.mutex);
-        }
-        if (executor.queue_len == 0 and executor.closing) {
-            executor.mutex.unlock(executor.io);
-            return;
-        }
-        const task = executor.queue[executor.queue_head].?;
-        executor.queue[executor.queue_head] = null;
-        executor.queue_head = (executor.queue_head + 1) % executor.queue.len;
-        executor.queue_len -= 1;
-        executor.mutex.unlock(executor.io);
-        runDispatchTask(task);
-    }
 }
 
 const OwnedRequest = struct {
@@ -455,28 +349,14 @@ const DispatchTask = struct {
     captured: response.Capture = .{},
     capture_state: response.H2CaptureState = .{},
     done: std.atomic.Value(bool) = .init(false),
-    done_mutex: std.Io.Mutex = .init,
-    done_condition: std.Io.Condition = .init,
+    future: std.Io.Future(void) = undefined,
+    future_awaited: bool = false,
+    request_consumed: std.atomic.Value(usize) = .init(0),
     headers_ready: std.atomic.Value(bool) = .init(false),
     ready_enqueued: std.atomic.Value(bool) = .init(false),
     request_queue: streaming.ByteQueue,
     response_queue: streaming.ByteQueue,
     request_source: streaming.QueueSource,
-
-    fn finish(self: *DispatchTask) void {
-        const io = self.bridge.connection.io;
-        self.done_mutex.lockUncancelable(io);
-        self.done.store(true, .release);
-        self.done_condition.broadcast(io);
-        self.done_mutex.unlock(io);
-    }
-
-    fn waitDone(self: *DispatchTask) void {
-        const io = self.bridge.connection.io;
-        self.done_mutex.lockUncancelable(io);
-        while (!self.done.load(.acquire)) self.done_condition.waitUncancelable(io, &self.done_mutex);
-        self.done_mutex.unlock(io);
-    }
 };
 
 fn emptyReadyTasks() [ready_task_capacity]?*DispatchTask {
@@ -565,7 +445,7 @@ fn runDispatchTask(task: *DispatchTask) void {
     // A published response is already represented by a ready task. Only
     // handlers that failed before publishing headers need a completion wake.
     if (!task.headers_ready.load(.acquire)) signalDispatchReady(task);
-    task.finish();
+    task.done.store(true, .release);
 }
 
 fn dispatchStartBridge(
@@ -574,8 +454,11 @@ fn dispatchStartBridge(
     task_out: *?*anyopaque,
 ) callconv(.c) c_int {
     const bridge: *Bridge = @ptrCast(@alignCast(userdata));
+    // Include canceled handlers that have not yet unwound in admission.
+    // Repeated RST cannot grow the connection's outstanding work unboundedly.
+    if (bridge.live_tasks.load(.acquire) >= ready_task_capacity) return -2;
     const task = capture_allocator.create(DispatchTask) catch return -1;
-    const request_queue = streaming.ByteQueue.init(capture_allocator, http_config.max_form_body_bytes) catch {
+    const request_queue = streaming.ByteQueue.init(capture_allocator, 64 * 1024) catch {
         capture_allocator.destroy(task);
         return -1;
     };
@@ -599,15 +482,15 @@ fn dispatchStartBridge(
         .response_queue = response_queue,
         .request_source = undefined,
     };
-    task.request_source = .{ .io = bridge.connection.io, .queue = &task.request_queue };
-    bridge.executor.submit(task) catch |err| {
+    task.request_source = .{ .io = bridge.connection.io, .queue = &task.request_queue, .consumed = &task.request_consumed };
+    _ = bridge.live_tasks.fetchAdd(1, .monotonic);
+    task.future = bridge.connection.io.concurrent(runDispatchTask, .{task}) catch {
+        _ = bridge.live_tasks.fetchSub(1, .release);
         task.request_queue.deinit(bridge.connection.io);
         task.response_queue.deinit(bridge.connection.io);
         task.request.deinit();
         capture_allocator.destroy(task);
-        return switch (err) {
-            error.DispatchQueueFull, error.DispatchExecutorClosed => -2,
-        };
+        return -2;
     };
     task_out.* = task;
     return 0;
@@ -622,18 +505,36 @@ fn dispatchPollBridge(userdata: *anyopaque, opaque_task: *anyopaque, captured_re
         return 2;
     }
     if (!task.done.load(.acquire)) return 0;
-    task.waitDone();
+    if (!task.future_awaited) {
+        task.future.await(task.bridge.connection.io);
+        task.future_awaited = true;
+    }
     return if (task.capture_state.claimed) 3 else -1;
 }
 
 fn dispatchCancelBridge(userdata: *anyopaque, opaque_task: *anyopaque) callconv(.c) void {
     const bridge: *Bridge = @ptrCast(@alignCast(userdata));
     const task: *DispatchTask = @ptrCast(@alignCast(opaque_task));
-    if (!bridge.executor.removeQueued(task)) {
-        task.request_queue.cancel(bridge.connection.io);
-        task.response_queue.cancel(bridge.connection.io);
-        task.waitDone();
+    task.request_queue.cancel(bridge.connection.io);
+    task.response_queue.cancel(bridge.connection.io);
+    if (task.done.load(.acquire)) {
+        finishDispatchTask(task);
+    } else {
+        // Handler cancellation can include application cleanup or uncancelable
+        // work. Keep it off the multiplexed session thread, retaining ownership
+        // until the future has joined. Fall back to joining on resource failure.
+        bridge.retiring.concurrent(bridge.connection.io, finishDispatchTask, .{task}) catch {
+            finishDispatchTask(task);
+        };
     }
+}
+
+fn finishDispatchTask(task: *DispatchTask) void {
+    const bridge = task.bridge;
+    defer _ = bridge.live_tasks.fetchSub(1, .release);
+    if (!task.future_awaited) task.future.cancel(bridge.connection.io);
+    // The producer can enqueue a final wake while cancellation unwinds.
+    // Remove it only after joining the future, before destroying the task.
     removeDispatchReady(task);
     task.capture_state.release(bridge.connection.io, &task.captured, capture_allocator);
     task.request_queue.deinit(bridge.connection.io);
@@ -658,6 +559,11 @@ fn dispatchDataBridge(userdata: *anyopaque, opaque_task: *anyopaque, data: [*]co
         task.request_queue.finish(bridge.connection.io);
     }
     return 0;
+}
+
+fn dispatchConsumedBridge(_: *anyopaque, opaque_task: *anyopaque) callconv(.c) usize {
+    const task: *DispatchTask = @ptrCast(@alignCast(opaque_task));
+    return task.request_consumed.swap(0, .acq_rel);
 }
 
 fn responseReadBridge(userdata: *anyopaque, opaque_task: *anyopaque, buffer: [*]u8, len: usize, end_out: *c_int) callconv(.c) isize {
@@ -686,6 +592,81 @@ fn responseReadyBridge(userdata: *anyopaque, opaque_task: *anyopaque) callconv(.
 
 fn releaseBridge(_: *anyopaque, captured_response: *response.Capture) callconv(.c) void {
     captured_response.deinit(capture_allocator);
+}
+
+test "HTTP2 cancellation retires uncancelable handlers without blocking the session" {
+    const Harness = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        returned: std.atomic.Value(bool) = .init(false),
+        mutex: std.Io.Mutex = .init,
+        condition: std.Io.Condition = .init,
+        released: bool = false,
+
+        fn dispatch(userdata: ?*anyopaque, _: *const Request, _: *response.Capture, _: ?streaming.Reader, _: *streaming.ByteQueue, _: *std.atomic.Value(bool), _: ?*response.H2CaptureState, _: ?response.H2Wake, _: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.mutex.lockUncancelable(std.testing.io);
+            defer self.mutex.unlock(std.testing.io);
+            self.entered.store(true, .release);
+            while (!self.released) self.condition.waitUncancelable(std.testing.io, &self.mutex);
+        }
+
+        fn cancel(bridge: *Bridge, task: *anyopaque, self: *@This()) void {
+            dispatchCancelBridge(bridge, task);
+            self.returned.store(true, .release);
+        }
+
+        fn release(self: *@This()) void {
+            self.mutex.lockUncancelable(std.testing.io);
+            self.released = true;
+            self.condition.broadcast(std.testing.io);
+            self.mutex.unlock(std.testing.io);
+        }
+    };
+    var harness = Harness{};
+    var connection: transport.Connection = .{ .io = std.testing.io, .stream = undefined };
+    var bridge: Bridge = .{
+        .connection = &connection,
+        .userdata = &harness,
+        .dispatch = Harness.dispatch,
+        .stream_timeout_ms = 0,
+        .idle_timeout_ms = 0,
+        .stopping = null,
+    };
+    defer bridge.retiring.cancel(std.testing.io);
+    const request = Request{
+        .method_ptr = "GET",
+        .method_len = 3,
+        .path_ptr = "/",
+        .path_len = 1,
+        .authority_ptr = null,
+        .authority_len = 0,
+        .headers_ptr = null,
+        .headers_len = 0,
+        .body_ptr = null,
+        .body_len = 0,
+        .error_status = 0,
+    };
+    var task: ?*anyopaque = null;
+    try std.testing.expectEqual(@as(c_int, 0), dispatchStartBridge(&bridge, &request, &task));
+    while (!harness.entered.load(.acquire)) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    const cancel_thread = std.Thread.spawn(.{}, Harness.cancel, .{ &bridge, task.?, &harness }) catch |err| {
+        harness.release();
+        dispatchCancelBridge(&bridge, task.?);
+        return err;
+    };
+    var attempts: usize = 0;
+    while (!harness.returned.load(.acquire) and attempts < 100) : (attempts += 1) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    }
+    const returned = harness.returned.load(.acquire);
+    const live_during_cleanup = bridge.live_tasks.load(.acquire);
+    harness.release();
+    cancel_thread.join();
+    bridge.retiring.cancel(std.testing.io);
+    try std.testing.expect(returned);
+    try std.testing.expectEqual(@as(usize, 1), live_during_cleanup);
+    try std.testing.expectEqual(@as(usize, 0), bridge.live_tasks.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), bridge.ready_len);
 }
 
 test "http2 mode maps to provider support" {

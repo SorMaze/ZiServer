@@ -206,10 +206,13 @@ pub const ByteQueue = struct {
 pub const QueueSource = struct {
     io: std.Io,
     queue: *ByteQueue,
+    consumed: ?*std.atomic.Value(usize) = null,
 
     pub fn readerFn(userdata: ?*anyopaque, destination: []u8) anyerror!usize {
         const self: *QueueSource = @ptrCast(@alignCast(userdata orelse return error.InvalidBodyStream));
-        return self.queue.readBlocking(self.io, destination);
+        const amount = try self.queue.readBlocking(self.io, destination);
+        if (self.consumed) |counter| _ = counter.fetchAdd(amount, .release);
+        return amount;
     }
 };
 

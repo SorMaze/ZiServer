@@ -8,8 +8,8 @@
    - 已实现 fill leader / waiter、失败释放、固定容量退化、可取消且可配置的 bounded wait，以及 `/stats` 的 `fill_wait_timeouts` 指标。
    - 默认等待 100 ms，超时后独立渲染；后续仅保留 stale-while-revalidate 评估。
 2. **HTTP/2 真正的连接内并发 dispatch（已完成）**
-   - stream 完成后深拷贝请求并提交共享的有界 dispatch executor；RST/会话关闭可取消并安全回收任务。
-   - nghttp2 session 线程只负责轮询完成项、提交响应和 socket 写入，不从 handler 线程并发调用 nghttp2；请求队列满时只重置对应 stream，不阻塞 session。`zibench` 支持 `--streams-per-connection=1..128`。
+   - HEADERS 到达后深拷贝请求并提交可取消的 Zig `std.Io` 并发任务，以每连接 128 个 stream 为上限；RST/会话关闭会取消并安全回收任务，等待正文不会占满固定的全局 dispatch pool。
+   - nghttp2 session 线程只负责轮询完成项、提交响应、补充窗口和 socket 写入，不从 handler 线程并发调用 nghttp2；64 KiB 请求队列通过消费进度控制 stream 窗口，connection 窗口独立补充，正常背压不重置 stream。`zibench` 支持 `--streams-per-connection=1..128`。
 3. **双向流式传递（已完成）**
    - 支持严格 chunked framing、extension/trailer、CL/TE 防歧义、`Expect: 100-continue`/417 和统一绝对 body deadline。
    - 已提供统一 request Reader 与 response begin/write/finish API；HTTP/1.1 在 header 路由后直接读取 socket/chunk decoder，并实时 chunked flush。

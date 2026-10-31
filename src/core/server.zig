@@ -46,7 +46,6 @@ const SharedServer = struct {
     http3_port: u16,
     stopping: *std.atomic.Value(bool),
     connection_registry: *transport.ConnectionRegistry,
-    dispatch_executor: ?*http2.DispatchExecutor,
     tls_handshake_timeout_ms: u32,
     header_timeout_ms: u32,
     body_timeout_ms: u32,
@@ -198,16 +197,6 @@ fn run(
     const connection_slots = try allocator.alloc(?*transport.Connection, workers);
     defer allocator.free(connection_slots);
     var connection_registry = transport.ConnectionRegistry.init(io, connection_slots);
-    const dispatch_executor = if (config.http2 == .on and http2.linked)
-        try http2.DispatchExecutor.create(
-            allocator,
-            io,
-            @min(16, @max(4, std.Thread.getCpuCount() catch 4)),
-            256,
-        )
-    else
-        null;
-    defer if (dispatch_executor) |executor| executor.destroy();
     var certificate_control: ?tls_control.Controller = if (config.tls_control_file) |path|
         tls_control.Controller.init(path, .{
             .provider = config.tlsProvider(),
@@ -253,7 +242,6 @@ fn run(
         .http3_port = config.http3_port,
         .stopping = &stopping,
         .connection_registry = &connection_registry,
-        .dispatch_executor = dispatch_executor,
         .tls_handshake_timeout_ms = config.tls_handshake_timeout_ms,
         .header_timeout_ms = config.header_timeout_ms,
         .body_timeout_ms = config.body_timeout_ms,
@@ -623,7 +611,6 @@ fn workerLoop(shared: *SharedServer, worker_index: usize) void {
             .keep_alive_timeout_ms = shared.keep_alive_timeout_ms,
             .stopping = shared.stopping,
             .connection_registry = shared.connection_registry,
-            .dispatch_executor = shared.dispatch_executor,
             .worker_index = worker_index,
             .access_log_enabled = shared.access_log_enabled,
             .peer_ip = pending.peer_ip,
